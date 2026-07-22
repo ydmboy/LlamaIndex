@@ -7,10 +7,14 @@ __pycache__/
 .ipynb_checkpoints/
 
 # ===== 大文件/生成文件（不推送到 GitHub）=====
-models/                    # embedding 模型（33.6 GB，目标机单独下载）
-storage/                   # 生成的索引数据（目标机重新构建）
-LlamaIndex_RAG_deploy.rar  # 部署打包文件
-_deploy_pkg/run_vector_demo.py  # 旧版主脚本副本
+# embedding 模型（33.6 GB，目标机单独下载）
+models/
+# 生成的索引数据（目标机重新构建）
+storage/
+# 部署打包文件
+LlamaIndex_RAG_deploy.rar
+# 旧版主脚本副本
+_deploy_pkg/run_vector_demo.py
 
 # ===== 官方 LlamaIndex 框架（不跟踪，用 pip 安装）=====
 llama-index-core/
