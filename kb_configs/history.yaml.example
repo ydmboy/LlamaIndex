@@ -1,0 +1,7 @@
+# 知识库配置示例：历史资料
+name: "历史资料"
+description: "中外历史文献与笔记"
+data_dir: "D:\\wiki\\history"
+file_exts:
+  - ".md"
+  - ".txt"

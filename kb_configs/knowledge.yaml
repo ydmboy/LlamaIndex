@@ -1,0 +1,3 @@
+name: "通用知识数据库"
+description: "通用知识、历史、政治、文学等综合资料"
+file_exts: [".md", ".txt"]

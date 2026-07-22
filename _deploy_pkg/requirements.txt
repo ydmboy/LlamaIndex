@@ -1,0 +1,25 @@
+# ===== LlamaIndex 核心与集成（PyPI 版本，非可编辑安装）=====
+llama-index-core==0.14.23
+llama-index-embeddings-huggingface==0.7.0
+llama-index-llms-deepseek==0.3.0
+llama-index-llms-ollama==0.10.1
+llama-index-llms-openai==0.6.26
+llama-index-readers-file==0.6.0
+
+# ===== Embedding 模型栈 =====
+sentence-transformers==5.6.0
+transformers==4.46.3
+tokenizers==0.20.3
+huggingface-hub==0.36.2
+safetensors==0.8.0
+
+# ===== Web UI =====
+streamlit==1.59.2
+
+# ===== 工具 =====
+tqdm>=4.66
+nltk>=3.9
+pyyaml>=6.0
+
+# 注意：torch 不在此文件中，由 deploy.ps1 单独安装 GPU 版（cu121）
+# 若目标机无 NVIDIA GPU，改用：uv pip install torch==2.5.1（CPU 版）

@@ -1,0 +1,9 @@
+# 知识库配置示例：文学作品
+# 文件名即知识库 ID（如 literature.yaml → 知识库 ID = literature）
+
+name: "文学作品"
+description: "中外文学经典作品"
+data_dir: "D:\\wiki\\literature"
+file_exts:
+  - ".md"
+  - ".txt"

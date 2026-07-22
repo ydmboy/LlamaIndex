@@ -1,0 +1,3 @@
+name: "代码知识数据库"
+description: "代码文档、技术笔记、API 文档"
+file_exts: [".md", ".txt", ".py"]

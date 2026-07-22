@@ -1,0 +1,12 @@
+# 知识库配置示例：北京日报
+# 复制此文件并修改 name/data_dir 即可创建新知识库
+# 文件名即知识库 ID（如 beijing_daily.yaml → 知识库 ID = beijing_daily）
+
+name: "北京日报"
+description: "北京日报全文数据"
+data_dir: "D:\\wiki\\beijing_daily\\2026-06-30"
+# storage_dir 留空则自动用 ./storage/<kb_id>
+# storage_dir: "./storage/beijing_daily"
+file_exts:
+  - ".md"
+  - ".txt"

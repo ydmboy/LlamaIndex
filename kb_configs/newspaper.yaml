@@ -1,0 +1,3 @@
+name: "报纸数据库"
+description: "各类报纸全文数据，支持跨报纸检索"
+file_exts: [".md", ".txt"]

@@ -1,0 +1,62 @@
+# ===== Python =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# ===== 大文件/生成文件（不推送到 GitHub）=====
+models/                    # embedding 模型（33.6 GB，目标机单独下载）
+storage/                   # 生成的索引数据（目标机重新构建）
+LlamaIndex_RAG_deploy.rar  # 部署打包文件
+_deploy_pkg/run_vector_demo.py  # 旧版主脚本副本
+
+# ===== 官方 LlamaIndex 框架（不跟踪，用 pip 安装）=====
+llama-index-core/
+llama-index-integrations/
+llama-index-instrumentation/
+llama-index-utils/
+docs/
+docs.config.mjs
+llama-dev/
+scripts/
+.github/
+Makefile
+pyproject.toml
+uv.lock
+CITATION.cff
+LICENSE
+.pre-commit-config.yaml
+.readthedocs.yaml
+CHANGELOG.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+README.md
+RELEASE_HEAD.md
+SECURITY.md
+STALE.md
+
+# ===== Trae IDE =====
+.trae/
+
+# ===== 日志和临时文件 =====
+*.log
+.streamlit/
+*.egg-info/
+.coverage
+coverage.xml
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.code-workspace
+
+# ===== 系统 =====
+.env
+credentials.json
+token.json
+.python-version
+.DS_Store
+*.sqlite3
+*.db

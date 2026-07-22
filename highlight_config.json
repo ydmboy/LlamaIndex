@@ -1,0 +1,17 @@
+{
+    "_comment": "重点句高亮样式配置文件 - 修改后重启程序生效",
+    "_comment_color_names": "可选颜色名: black, red, green, yellow, blue, magenta, cyan, white, bright_black, bright_red, bright_green, bright_yellow, bright_blue, bright_magenta, bright_cyan, bright_white, null (表示不设置)",
+    "_comment_example": "示例: 亮黄文字 + 下划线 (在蓝色 PowerShell 背景上对比强烈)",
+
+    "foreground": "bright_yellow",
+    "background": null,
+    "bold": false,
+    "italic": false,
+    "underline": true,
+    "strikethrough": false,
+    "reverse": false,
+
+    "_comment_fallback": "非 tty 环境 (IDE 捕获/管道重定向) 不支持 ANSI 颜色，使用以下文本标记包裹重点句",
+    "fallback_prefix": ">>>",
+    "fallback_suffix": "<<<"
+}
