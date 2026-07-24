@@ -589,7 +589,7 @@ def _extract_keyword_from_query(question: str) -> str:
     """从聚合查询中提取目标关键词（去掉"列出所有"等虚词）。"""
     cleaned = re.sub(
         r"列出所有|列出全部|所有的|全部的|有哪些|有什么|列举|全部列出|"
-        r"请|吗|呢|啊|吧|?|？|列出|所有|全部",
+        r"请|吗|呢|啊|吧|\?|？|列出|所有|全部",
         "", question
     )
     return cleaned.strip()
@@ -871,7 +871,7 @@ def _handle_fulltext_query(question: str, index, top_k: int = 20) -> bool:
         parts.append(preview)
 
     parts.append("\n" + "=" * 60)
-    parts.append(f"提示：全文搜索按 BM25 相关性排序，不调 LLM。用 'mode vector' 切换到向量检索获取 LLM 回答。")
+    parts.append(f"提示：全文搜索按 BM25 相关性排序，不调 LLM。用 mode 命令切换到向量检索获取 LLM 回答。")
     print_paged("\n".join(parts))
 
     sys.stdout.flush()
@@ -1173,7 +1173,7 @@ def _load_or_build_kb(kb_id: str, cfg: dict) -> VectorStoreIndex:
     print(f"    存储到: {kb_storage}")
     print(f"    使用 ingest <路径> 命令添加文档")
     storage_context = StorageContext.from_defaults()
-    index = VectorStoreIndex(storage_context=storage_context)
+    index = VectorStoreIndex(nodes=[], storage_context=storage_context)
     index.set_index_id(INDEX_ID)
     Path(kb_storage).mkdir(parents=True, exist_ok=True)
     index.storage_context.persist(kb_storage)
@@ -1209,12 +1209,9 @@ def load_or_build_index() -> VectorStoreIndex:
     storage_context = StorageContext.from_defaults()
     pipeline = make_pipeline(storage_context)
 
-    hashes_before = len(storage_context.docstore.get_all_document_hashes())
     print(f"[构建] 运行 IngestionPipeline（哈希去重 + 切块 + 向量化）...")
     nodes = pipeline.run(documents=documents, show_progress=True)
     hashes_after = len(storage_context.docstore.get_all_document_hashes())
-    new_docs = hashes_after - hashes_before
-    skipped = len(documents) - new_docs
 
     # nodes 已由 pipeline 完成 embedding，VectorStoreIndex 会跳过已有 embedding 不重复计算
     index = VectorStoreIndex(
@@ -1225,8 +1222,7 @@ def load_or_build_index() -> VectorStoreIndex:
     index.storage_context.persist(STORAGE_DIR)
     total_size = get_storage_size(STORAGE_DIR)
     print(f"    -> 索引已持久化到 {STORAGE_DIR}，下次启动将直接加载")
-    print(f"    -> 去重统计: 输入 {len(documents)} 文档 → 新增 {new_docs} → 跳过 {skipped} 个重复")
-    print(f"    -> docstore 共跟踪 {hashes_after} 个唯一哈希")
+    print(f"    -> 输入 {len(documents)} 个文档，产出 {len(nodes)} 个节点，docstore 共跟踪 {hashes_after} 个唯一哈希")
     print(f"    -> 存储容量: {format_size(total_size)}")
     return index
 
@@ -1616,27 +1612,65 @@ def main() -> None:
                 continue
             print(f"\n[ingest] 目标: {path} -> 知识库 [{current_cfg.get('name', current_kb_id)}]")
             try:
+                # 惰性读取：逐文件加载，避免一次性把整个语料库载入内存
+                # （旧版 load_data() 会先读入全部文档，大语料下内存随文件数线性膨胀）
                 if path.is_file():
-                    docs = SimpleDirectoryReader(input_files=[str(path)], filename_as_id=True).load_data()
+                    reader = SimpleDirectoryReader(input_files=[str(path)], filename_as_id=True)
+                    total_files = 1
                 else:
-                    docs = SimpleDirectoryReader(input_dir=str(path), required_exts=current_cfg.get("file_exts", [".md", ".txt"]), recursive=True, filename_as_id=True).load_data()
-                print(f"    -> 加载 {len(docs)} 个文档，开始增量写入（哈希去重）...")
+                    exts = current_cfg.get("file_exts", [".md", ".txt"])
+                    reader = SimpleDirectoryReader(input_dir=str(path), required_exts=exts, recursive=True, filename_as_id=True)
+                    exts_l = {e.lower() for e in exts}
+                    total_files = sum(1 for p in Path(path).rglob("*") if p.is_file() and p.suffix.lower() in exts_l)
+                print(f"    -> 发现 {total_files} 个文件，逐文件加载并增量写入（哈希去重）...")
                 pipeline = make_pipeline(index.storage_context)
-                hashes_before = len(index.storage_context.docstore.get_all_document_hashes())
                 size_before = get_storage_size(current_cfg["storage_dir"])
+
+                # 提速关键：缓存全库哈希。llama-index 的 DUPLICATES_ONLY 在每次
+                # pipeline.run 时都全量重建哈希字典（O(已存条目数)），逐文档调用
+                # 总开销 O(N²)——数千文件后每个文件仅哈希扫描就要几百毫秒且越来越慢。
+                # 这里缓存一份并在 set_document_hash 时增量更新，使每次检查降为 O(1)。
+                # 注：切块节点的哈希仍写入真实 docstore（不参与输入文档级去重判断），
+                # 文档级去重语义与原版完全一致。
+                docstore = index.storage_context.docstore
+                _orig_get_hashes = docstore.get_all_document_hashes
+                _orig_set_hash = docstore.set_document_hash
+                _hash_cache = _orig_get_hashes()
+
+                def _get_hashes_cached():
+                    return _hash_cache
+
+                def _set_hash_cached(doc_id, doc_hash):
+                    _orig_set_hash(doc_id, doc_hash)
+                    _hash_cache[doc_hash] = doc_id
+
+                object.__setattr__(docstore, "get_all_document_hashes", _get_hashes_cached)
+                object.__setattr__(docstore, "set_document_hash", _set_hash_cached)
+
                 all_new_nodes = []
-                for i, doc in enumerate(tqdm(docs, desc="ingest", unit="doc", ncols=80, leave=False), 1):
-                    fname = (doc.metadata or {}).get("file_name", "") or doc.get_text()[:30]
-                    new_nodes = pipeline.run(documents=[doc], show_progress=False)
-                    all_new_nodes.extend(new_nodes)
-                    tqdm.write(f"    [{i}/{len(docs)}] 处理: {fname}（产出 {len(new_nodes)} 节点）")
+                new_docs = 0
+                skipped = 0
+                i = 0
+                try:
+                    for doc_batch in tqdm(reader.iter_data(), desc="ingest", unit="file", total=total_files, ncols=80, leave=False):
+                        for doc in doc_batch:
+                            i += 1
+                            fname = (doc.metadata or {}).get("file_name", "") or doc.get_text()[:30]
+                            new_nodes = pipeline.run(documents=[doc], show_progress=False)
+                            all_new_nodes.extend(new_nodes)
+                            if new_nodes:
+                                new_docs += 1
+                            else:
+                                skipped += 1
+                            tqdm.write(f"    [{i}/{total_files}] 处理: {fname}（产出 {len(new_nodes)} 节点）")
+                finally:
+                    object.__setattr__(docstore, "get_all_document_hashes", _orig_get_hashes)
+                    object.__setattr__(docstore, "set_document_hash", _orig_set_hash)
                 if all_new_nodes:
                     index.insert_nodes(all_new_nodes)
                 index.storage_context.persist(persist_dir=current_cfg["storage_dir"])
                 hashes_after = len(index.storage_context.docstore.get_all_document_hashes())
                 size_after = get_storage_size(current_cfg["storage_dir"])
-                new_docs = hashes_after - hashes_before
-                skipped = len(docs) - new_docs
                 size_delta = size_after - size_before
                 print(f"    -> 完成！新增 {new_docs} 个文档（{len(all_new_nodes)} 个节点），跳过 {skipped} 个重复")
                 print(f"    -> 已持久化到 {current_cfg['storage_dir']}，docstore 共跟踪 {hashes_after} 个唯一哈希")
