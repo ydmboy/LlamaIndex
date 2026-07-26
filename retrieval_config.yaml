@@ -1,0 +1,19 @@
+# retrieval_config.yaml — 检索参数统一配置（修改后重启程序生效）
+# 文件不存在时全部使用代码内默认值，程序可独立运行
+
+vector:
+  similarity_top_k: 5           # 向量检索返回片段数（CLI/Web 统一）
+  response_mode: tree_summarize  # LLM 回答模式
+
+fulltext:
+  top_k: 20                     # 全文搜索返回片段数
+  bm25_k1: 1.5                  # BM25 词频饱和参数
+  bm25_b: 0.75                  # BM25 文档长度归一化参数
+
+chunk:
+  chunk_size: 512               # 文本分块大小
+  chunk_overlap: 50             # 分块重叠
+
+highlight:
+  top_n: 2                      # 每个片段高亮几句
+  threshold: 0.5                # 相似度低于此值的句子不高亮

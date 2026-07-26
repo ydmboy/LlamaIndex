@@ -52,21 +52,61 @@ try:
 except ImportError:
     Ollama = None
 
+# ---- 检索参数配置（retrieval_config.yaml）----
+RETRIEVAL_CONFIG_FILE = "retrieval_config.yaml"
+
+
+def _load_retrieval_config() -> dict:
+    """从 retrieval_config.yaml 加载检索参数。文件不存在时用默认值，保证程序可独立运行。"""
+    default = {
+        "vector": {"similarity_top_k": 5, "response_mode": "tree_summarize"},
+        "fulltext": {"top_k": 20, "bm25_k1": 1.5, "bm25_b": 0.75},
+        "chunk": {"chunk_size": 512, "chunk_overlap": 50},
+        "highlight": {"top_n": 2, "threshold": 0.5},
+    }
+    config_path = Path(RETRIEVAL_CONFIG_FILE)
+    if not config_path.exists():
+        return default
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            user_cfg = yaml.safe_load(f) or {}
+        # 按分区合并：用户配置覆盖默认值
+        merged = {}
+        for section, sec_default in default.items():
+            merged[section] = {**sec_default, **(user_cfg.get(section) or {})}
+        return merged
+    except Exception as e:
+        print(f"[警告] 加载检索配置失败 {RETRIEVAL_CONFIG_FILE}: {e}，使用默认值")
+        return default
+
+
+_RETR_CFG = _load_retrieval_config()
+
+
+def _make_query_engine(index):
+    """统一的 query_engine 创建，参数来自 retrieval_config.yaml（CLI/Web 共用）。"""
+    return index.as_query_engine(
+        response_mode=_RETR_CFG["vector"]["response_mode"],
+        similarity_top_k=_RETR_CFG["vector"]["similarity_top_k"],
+    )
+
+
 # ---- 配置（均可用环境变量覆盖，便于跨机器部署）----
 DATA_DIR = os.environ.get("DATA_DIR", r"D:\wiki\beijing_daily\2026-06-30")
 STORAGE_DIR = os.environ.get("STORAGE_DIR", "./storage")
 INDEX_ID = "vector_index"
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "")  # 空=启动时交互选择，或设为本地路径/HF ID
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 50
+CHUNK_SIZE = _RETR_CFG["chunk"]["chunk_size"]
+CHUNK_OVERLAP = _RETR_CFG["chunk"]["chunk_overlap"]
 
 # ---- 多知识库配置 ----
 KB_CONFIGS_DIR = "kb_configs"   # YAML 知识库配置目录
 DEFAULT_KB_ID = "newspaper"  # 启动菜单的默认数据库 ID  # 启动时默认选中的知识库 ID
 
 # ---- 高亮配置（纯展示层功能，不影响索引或检索）----
-HIGHLIGHT_TOP_N = 2                  # 每个片段高亮几句（按相似度排序取 top-N）
-HIGHLIGHT_THRESHOLD = 0.5            # 相似度低于此值的句子不高亮（避免噪音）
+HIGHLIGHT_TOP_N = _RETR_CFG["highlight"]["top_n"]       # 每个片段高亮几句（按相似度排序取 top-N）
+HIGHLIGHT_THRESHOLD = _RETR_CFG["highlight"]["threshold"]  # 相似度低于此值的句子不高亮（避免噪音）
 HIGHLIGHT_SENTENCE_SPLIT = r"[。！？\n]+"  # 中文分句正则（按句号/感叹号/问号/换行切分）
 HIGHLIGHT_CONFIG_FILE = "highlight_config.json"  # 高亮样式配置文件（颜色/下划线/斜体等）
 
@@ -79,7 +119,7 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "").lower()
 def _select_llm_provider() -> str:
     """交互式选择 LLM 提供商。若已通过环境变量 LLM_PROVIDER 指定，则直接使用。"""
     providers = [
-        ("deepseek", "DeepSeek (deepseek-chat)"),
+        ("deepseek", "DeepSeek (deepseek-v4-pro / deepseek-v4-flash)"),
         ("qwen",     "通义千问 (qwen-plus / qwen-turbo)"),
         ("zhipu",    "智谱 GLM (glm-4 / glm-4-flash)"),
         ("ollama",   "Ollama 本地模型 (qwen2.5:7b 等)"),
@@ -111,7 +151,7 @@ def _build_llm(provider: str):
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
             sys.exit("错误：请设置环境变量 DEEPSEEK_API_KEY")
-        return DeepSeek(model="deepseek-chat", api_key=api_key, temperature=0.0, max_tokens=512)
+        return DeepSeek(model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"), api_key=api_key, temperature=0.0, max_tokens=512)
 
     if provider == "qwen":
         # 阿里云通义千问：OpenAI 兼容接口
@@ -770,8 +810,8 @@ class FullTextSearcher:
             return []
 
         # BM25 参数
-        k1 = 1.5  # 词频饱和参数
-        b = 0.75   # 文档长度归一化参数
+        k1 = _RETR_CFG["fulltext"]["bm25_k1"]  # 词频饱和参数
+        b = _RETR_CFG["fulltext"]["bm25_b"]    # 文档长度归一化参数
 
         # 计算每个文档的 BM25 分数
         scores = {}  # {doc_id: score}
@@ -822,7 +862,7 @@ def _get_fulltext_searcher(index) -> FullTextSearcher:
     return _fulltext_searcher
 
 
-def _handle_fulltext_query(question: str, index, top_k: int = 20) -> bool:
+def _handle_fulltext_query(question: str, index, top_k: int = _RETR_CFG["fulltext"]["top_k"]) -> bool:
     """
     处理全文搜索查询：BM25 排序，返回匹配片段。
 
@@ -1408,7 +1448,7 @@ def main() -> None:
     print(f"  存储到: {current_cfg['storage_dir']}")
     index = _load_or_build_kb(current_kb_id, current_cfg)
     sys.stdout.flush()  # 确保索引加载完成后终端输出完整
-    query_engine = index.as_query_engine(response_mode="tree_summarize")
+    query_engine = _make_query_engine(index)
 
     # 5) 选择检索模式
     current_mode = _select_retrieval_mode()
@@ -1531,7 +1571,7 @@ def main() -> None:
             else:
                 print("数据库不存在，创建空索引 ...")
             index = _load_or_build_kb(current_kb_id, current_cfg)
-            query_engine = index.as_query_engine(response_mode="tree_summarize")
+            query_engine = _make_query_engine(index)
             print(f"重建完成: {current_cfg.get('name', current_kb_id)}（空库，请用 ingest 添加文档）")
             sys.stdout.flush()
             continue
@@ -1676,7 +1716,7 @@ def main() -> None:
                 print(f"    -> 已持久化到 {current_cfg['storage_dir']}，docstore 共跟踪 {hashes_after} 个唯一哈希")
                 print(f"    -> 存储容量: {format_size(size_after)}（本次 {'+' if size_delta >= 0 else ''}{format_size(size_delta)}）")
                 sys.stdout.flush()  # 确保终端输出完整，避免后续 input() 卡顿
-                query_engine = index.as_query_engine(response_mode="tree_summarize")
+                query_engine = _make_query_engine(index)
             except Exception as e:
                 print(f"[ingest 出错] {type(e).__name__}: {e}")
             sys.stdout.flush()  # 确保终端输出完整
@@ -1722,7 +1762,7 @@ def main() -> None:
 
             # ---- 模式2：全文搜索 ----
             if current_mode == "fulltext":
-                _handle_fulltext_query(question, index, top_k=20)
+                _handle_fulltext_query(question, index)
                 continue
 
             # ---- 模式3：向量检索（默认）----

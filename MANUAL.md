@@ -193,11 +193,28 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 | 变量 | 必需 | 说明 |
 |------|------|------|
 | `DEEPSEEK_API_KEY` | 选 DeepSeek 时 | DeepSeek API Key |
+| `DEEPSEEK_MODEL` | 否 | DeepSeek 模型名（默认 `deepseek-v4-pro`，可选 `deepseek-v4-flash`） |
 | `DASHSCOPE_API_KEY` / `ZHIPU_API_KEY` | 选对应厂商时 | 千问 / 智谱 Key |
 | `LLM_PROVIDER` | 否 | `deepseek`/`qwen`/`zhipu`/`ollama`/`custom`，预设后跳过 LLM 菜单 |
 | `EMBED_MODEL` | 否 | embedding 模型路径或 HF ID，预设后跳过模型菜单 |
 | `DATA_DIR` / `STORAGE_DIR` | 否 | 仅无 `kb_configs` 时的遗留单库模式用，当前三库配置下用不到 |
 | `MAX_DOCS` | 否 | 调试用，限制上述遗留模式构建时的文档数 |
+
+### 检索参数配置（`retrieval_config.yaml`）
+
+集中管理所有检索参数，CLI/Web 共用一份。文件不存在时用代码内默认值，程序可独立运行。修改后重启生效。
+
+| 分区 | 参数 | 默认值 | 说明 |
+|------|------|--------|------|
+| `vector` | `similarity_top_k` | 5 | 向量检索返回片段数（CLI/Web 统一） |
+| `vector` | `response_mode` | `tree_summarize` | LLM 回答模式 |
+| `fulltext` | `top_k` | 20 | 全文搜索返回片段数 |
+| `fulltext` | `bm25_k1` | 1.5 | BM25 词频饱和参数 |
+| `fulltext` | `bm25_b` | 0.75 | BM25 文档长度归一化参数 |
+| `chunk` | `chunk_size` | 512 | 文本分块大小 |
+| `chunk` | `chunk_overlap` | 50 | 分块重叠 |
+| `highlight` | `top_n` | 2 | 每个片段高亮几句 |
+| `highlight` | `threshold` | 0.5 | 相似度低于此值的句子不高亮 |
 
 ### 代码常量（`run_vector_demo.py` 顶部）
 
@@ -205,8 +222,8 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 |------|-----|------|
 | `KB_CONFIGS_DIR` | `kb_configs` | 库配置目录 |
 | `DEFAULT_KB_ID` | `newspaper` | 启动默认库 |
-| `CHUNK_SIZE` / `CHUNK_OVERLAP` | 512 / 50 | 切块参数 |
-| `HIGHLIGHT_TOP_N` / `HIGHLIGHT_THRESHOLD` | 2 / 0.5 | 重点句高亮参数 |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | 由 `retrieval_config.yaml` 控制 | 切块参数（默认 512/50） |
+| `HIGHLIGHT_TOP_N` / `HIGHLIGHT_THRESHOLD` | 由 `retrieval_config.yaml` 控制 | 重点句高亮参数（默认 2/0.5） |
 | `PAGER_THRESHOLD_LINES` | 30 | 超过此行数触发分页 |
 
 ### 高亮样式（`highlight_config.json`）

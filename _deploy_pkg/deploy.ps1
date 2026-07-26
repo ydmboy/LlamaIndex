@@ -48,6 +48,7 @@ Write-Host "===== 部署完成 =====" -ForegroundColor Green
 Write-Host ""
 Write-Host "运行前设置环境变量："
 Write-Host '  $env:DEEPSEEK_API_KEY="你的DeepSeek_key"'
+Write-Host '  $env:DEEPSEEK_MODEL="deepseek-v4-pro"   # 或 deepseek-v4-flash'
 Write-Host '  $env:LLM_PROVIDER="deepseek"'
 Write-Host '  $env:EMBED_MODEL=".\models\bge-m3"'
 Write-Host ""

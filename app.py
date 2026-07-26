@@ -42,12 +42,14 @@ from run_vector_demo import (
     _handle_fulltext_query,
     _get_fulltext_searcher,
     FullTextSearcher,
+    _make_query_engine,
     # 展示
     _highlight_relevant_sentences,
     # 常量
     CHUNK_SIZE,
     CHUNK_OVERLAP,
     INDEX_ID,
+    _RETR_CFG,
 )
 
 from llama_index.core import (
@@ -103,7 +105,7 @@ def get_llm():
     """获取 DeepSeek LLM（session_state 缓存）。"""
     if "llm_instance" not in st.session_state:
         st.session_state.llm_instance = DeepSeek(
-            model="deepseek-chat",
+            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
             api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
             temperature=0.3,
             max_tokens=2048,
@@ -235,10 +237,7 @@ def render_sidebar():
             try:
                 index = load_index_with_progress(storage_dir, cfg.get("name", selected_kb_id))
                 st.session_state.index = index
-                st.session_state.query_engine = index.as_query_engine(
-                    response_mode="tree_summarize",
-                    similarity_top_k=5,
-                )
+                st.session_state.query_engine = _make_query_engine(index)
                 st.session_state.current_kb_id = selected_kb_id
                 st.session_state.current_kb_cfg = cfg
                 st.session_state.fulltext_searcher = None
@@ -359,10 +358,7 @@ def render_chat_tab():
                 try:
                     index = load_index_with_progress(storage_dir, cfg.get("name", selected_kb_id))
                     st.session_state.index = index
-                    st.session_state.query_engine = index.as_query_engine(
-                        response_mode="tree_summarize",
-                        similarity_top_k=5,
-                    )
+                    st.session_state.query_engine = _make_query_engine(index)
                     st.session_state.current_kb_id = selected_kb_id
                     st.session_state.current_kb_cfg = cfg
                     st.session_state.fulltext_searcher = None
@@ -431,7 +427,7 @@ def render_chat_tab():
                         if not searcher._built:
                             with st.spinner("首次使用，构建倒排索引 ..."):
                                 searcher.build()
-                        results = searcher.search(question, top_k=20)
+                        results = searcher.search(question, top_k=_RETR_CFG["fulltext"]["top_k"])
                         answer_parts = [f"**全文搜索结果：共 {len(results)} 条（BM25 排序）**\n"]
                         for i, (doc_id, score, node) in enumerate(results[:10], 1):
                             meta = node.metadata or {}
@@ -600,10 +596,7 @@ def _do_ingest(data_dir: str):
         storage_context.persist(persist_dir=st.session_state.current_kb_cfg["storage_dir"])
 
         # 刷新 query_engine
-        st.session_state.query_engine = st.session_state.index.as_query_engine(
-            response_mode="tree_summarize",
-            similarity_top_k=5,
-        )
+        st.session_state.query_engine = _make_query_engine(st.session_state.index)
 
         elapsed = time.time() - t0
         progress_bar.progress(100, text=f"完成！{len(documents)} 文档 → {len(nodes)} 节点，耗时 {elapsed:.1f}s")
@@ -700,10 +693,7 @@ def render_kb_management_tab():
                 try:
                     index = load_index_with_progress(storage_dir, cfg.get("name", kb_id))
                     st.session_state.index = index
-                    st.session_state.query_engine = index.as_query_engine(
-                        response_mode="tree_summarize",
-                        similarity_top_k=5,
-                    )
+                    st.session_state.query_engine = _make_query_engine(index)
                     st.session_state.current_kb_id = kb_id
                     st.session_state.current_kb_cfg = cfg
                     st.session_state.fulltext_searcher = None

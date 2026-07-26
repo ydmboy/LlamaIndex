@@ -61,6 +61,7 @@ LlamaIndex RAG 系统 — 部署说明
 
 六、配置项（环境变量，均可选）
   DEEPSEEK_API_KEY  DeepSeek API Key（必需）
+  DEEPSEEK_MODEL    DeepSeek 模型名（默认 deepseek-v4-pro，可选 deepseek-v4-flash）
   LLM_PROVIDER      LLM 提供商（默认 deepseek，可选 qwen/glm/ollama）
   EMBED_MODEL       embedding 模型路径（默认 .\models\bge-m3）
   CHUNK_SIZE        文本分块大小（默认 512）
