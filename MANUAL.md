@@ -217,6 +217,9 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 | `highlight` | `threshold` | 0.5 | 相似度低于此值的句子不高亮 |
 | `ingest` | `batch_size` | 1000 | 单批 ingest 最大文件数，每批结束自动落盘检查点 |
 | `ingest` | `auto_continue_timeout` | 10 | 每批结束后等待确认的秒数，超时自动继续 |
+| `dedup` | `simhash_enabled` | `true` | SimHash 近似转载拦截开关（报纸转载/不同文件同内容时跳过） |
+| `dedup` | `simhash_threshold` | 3 | 64 位指纹汉明距离阈值，≤ 此值判为同一篇（调大更宽松、误杀增多） |
+| `dedup` | `simhash_min_chars` | 8 | 正文归一化后短于此长度只按精确哈希去重，不算 SimHash |
 
 > 注：表中"默认值"指 YAML 文件缺失时的代码兜底值。当前仓库 `retrieval_config.yaml` 实际配置为 `similarity_top_k: 10`、`fulltext.top_k: 20`，以 YAML 为准。
 

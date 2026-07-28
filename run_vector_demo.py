@@ -1249,7 +1249,7 @@ def _bootstrap_simhash_from_docstore(docstore, store: _SimHashStore) -> int:
                 cur = next_map.get(cur)
         # NEXT 链缺失时退化为无序拼接，保证不丢内容（SimHash 对局部顺序不敏感）
         ordered.extend(n for n in nodes if n.node_id not in seen)
-        store.add_text("".join(n.get_text() for n in ordered), file_path)
+        store.add_text("".join(n.get_content() for n in ordered), file_path)
     return len(by_file)
 
 
@@ -1278,7 +1278,7 @@ def _filter_near_duplicates(documents: list, store: _SimHashStore):
     保留文档的指纹立即写入 store，同批之内的转载也能拦截。"""
     kept, skipped = [], []
     for doc in documents:
-        text = doc.get_text()
+        text = doc.get_content()
         key, dist, kept_path = store.check_text(text)
         if key is not None:
             store.record_dup(key, (doc.metadata or {}).get("file_path", ""))
@@ -2067,9 +2067,9 @@ def main() -> None:
                     for doc_batch in tqdm(reader.iter_data(), desc="ingest", unit="file", total=total_files, ncols=80, leave=False):
                         for doc in doc_batch:
                             i += 1
-                            fname = (doc.metadata or {}).get("file_name", "") or doc.get_text()[:30]
+                            fname = (doc.metadata or {}).get("file_name", "") or doc.get_content()[:30]
                             # SimHash 转载拦截：与库内已有文章内容近似（含归一化后精确一致）则跳过
-                            dup_key, dup_dist, dup_kept = simhash_store.check_text(doc.get_text()) if simhash_store is not None else (None, -1, "")
+                            dup_key, dup_dist, dup_kept = simhash_store.check_text(doc.get_content()) if simhash_store is not None else (None, -1, "")
                             if dup_key is not None:
                                 near_skipped += 1
                                 batch_near_skipped += 1
@@ -2084,7 +2084,7 @@ def main() -> None:
                                     new_docs += 1
                                     batch_new_docs += 1
                                     if simhash_store is not None:
-                                        simhash_store.add_text(doc.get_text(), (doc.metadata or {}).get("file_path", ""))
+                                        simhash_store.add_text(doc.get_content(), (doc.metadata or {}).get("file_path", ""))
                                 else:
                                     skipped += 1
                                     batch_skipped += 1
