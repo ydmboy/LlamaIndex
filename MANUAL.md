@@ -157,11 +157,11 @@ file_exts: [".md", ".txt"]
 
 | 模式 | 原理 | 是否调 LLM | 适用场景 |
 |------|------|-----------|---------|
-| **向量检索**（默认） | 查询向量化 → 余弦相似度 top_k=2 → LLM 生成回答 + 来源片段 | 是（需有效 API Key） | 语义问答 |
+| **向量检索**（默认） | 查询向量化 → 余弦相似度 top_k=10 → LLM 生成回答 + 来源片段 | 是（需有效 API Key） | 语义问答 |
 | **聚合直遍** | 遍历 docstore 全部节点，按规则提取匹配行，100% 覆盖 | 否 | 列举类查询 |
 | **全文搜索** | 中文 bigram 分词 + BM25 排序 top_k=20 + 关键词高亮 | 否 | 关键词精确匹配 |
 
-- **向量检索**：top_k=2 写死在代码中，枚举类问题覆盖率低（实测输出自报"仅覆盖 0.004%"），此类问题请用聚合模式
+- **向量检索**：`similarity_top_k` 在 `retrieval_config.yaml` 统一配置（当前值 10，代码兜底默认 5）。枚举类问题覆盖率低，此类问题请用聚合模式
 - **聚合直遍**三种提取策略（按查询词自动选择）：
   - 含「标题/文章名/文章列表/文章目录」→ 提取 `### ` 开头的 markdown 标题行
   - 含「项目」→ 提取包含「项目」的行
@@ -215,6 +215,10 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 | `chunk` | `chunk_overlap` | 50 | 分块重叠 |
 | `highlight` | `top_n` | 2 | 每个片段高亮几句 |
 | `highlight` | `threshold` | 0.5 | 相似度低于此值的句子不高亮 |
+| `ingest` | `batch_size` | 1000 | 单批 ingest 最大文件数，每批结束自动落盘检查点 |
+| `ingest` | `auto_continue_timeout` | 10 | 每批结束后等待确认的秒数，超时自动继续 |
+
+> 注：表中"默认值"指 YAML 文件缺失时的代码兜底值。当前仓库 `retrieval_config.yaml` 实际配置为 `similarity_top_k: 10`、`fulltext.top_k: 20`，以 YAML 为准。
 
 ### 代码常量（`run_vector_demo.py` 顶部）
 
@@ -241,7 +245,7 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 3. `SentenceSplitter` 按句子边界切块
 4. bge-m3 把 chunk 转成 1024 维向量
 5. `SimpleVectorStore` 暴力余弦检索
-6. top_k=2 片段交 LLM 生成回答
+6. 按 `similarity_top_k`（当前 10）取片段交 LLM 生成回答
 7. 展示层：本地 embedding 在片段内找 top-N 相似句高亮（不改变检索结果）
 
 ### 哈希去重

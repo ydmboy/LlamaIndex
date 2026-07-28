@@ -2,7 +2,7 @@
 # 文件不存在时全部使用代码内默认值，程序可独立运行
 
 vector:
-  similarity_top_k: 5           # 向量检索返回片段数（CLI/Web 统一）
+  similarity_top_k: 10          # 向量检索返回片段数（CLI/Web 统一）
   response_mode: tree_summarize  # LLM 回答模式
 
 fulltext:
@@ -17,3 +17,7 @@ chunk:
 highlight:
   top_n: 2                      # 每个片段高亮几句
   threshold: 0.5                # 相似度低于此值的句子不高亮
+
+ingest:
+  batch_size: 1000              # 单批 ingest 最大文件数（大库分批处理，避免一次性内存压力）
+  auto_continue_timeout: 10     # 每批结束后等待用户确认的秒数，超时自动继续下一批
