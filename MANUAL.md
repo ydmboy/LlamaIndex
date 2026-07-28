@@ -260,8 +260,8 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 **Q：只有向量模式没反应/报错？**
 向量模式的回答生成需要有效的 LLM API Key 且能访问对应 API。聚合和全文模式不依赖 LLM，可无网使用。
 
-**Q：大批量 ingest 越到后来越慢？**
-旧版每处理一个文件都全量重建一次去重哈希表（总开销 O(N²)），且一次性把全部语料读入内存，几千文件后明显变慢、内存随文件数膨胀。已在 `run_vector_demo.py` 的 ingest 流程中修复：哈希缓存使每次检查降为 O(1)，并改为逐文件惰性读取。修复后每文件耗时不随库增长。**注意**：ingest 循环结束后才统一写索引和持久化，中途 Ctrl+C 不会落盘任何进度；大批量导入时让进程一次性跑完，期间避免运行其他吃内存的程序。
+**Q：大批量 ingest 越到后来越慢 / 最后写盘时 MemoryError？**
+旧版有三个问题，均已修复：① 每处理一个文件都全量重建去重哈希表（总开销 O(N²)），几千文件后明显变慢——已改为哈希缓存，每次检查 O(1)；② 一次性把全部语料读入内存——已改为逐文件惰性读取；③ 持久化用 `json.dumps` 在内存拼完整字符串（大库达数十 GB）再写盘，最后阶段极易内存耗尽——已改为 `json.dump` 流式写盘，内存不再翻倍（`app.py` 经 import 自动生效）。此外 **ingest 每 1000 个文件自动落盘一个检查点**，中断/崩溃后重新执行同一 ingest 命令，哈希去重会自动跳过已落盘的文件，相当于断点续传。
 
 **Q：RTX 50 系显卡报 `no kernel image is available for execution on the device`**
 torch 版本太旧（sm_120 需要 cu128 构建）：`uv pip install --reinstall-package torch torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128`

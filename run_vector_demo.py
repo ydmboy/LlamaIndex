@@ -63,6 +63,7 @@ def _load_retrieval_config() -> dict:
         "fulltext": {"top_k": 20, "bm25_k1": 1.5, "bm25_b": 0.75},
         "chunk": {"chunk_size": 512, "chunk_overlap": 50},
         "highlight": {"top_n": 2, "threshold": 0.5},
+        "ingest": {"batch_size": 1000, "auto_continue_timeout": 10},
     }
     config_path = Path(RETRIEVAL_CONFIG_FILE)
     if not config_path.exists():
@@ -91,6 +92,27 @@ def _make_query_engine(index):
         similarity_top_k=_RETR_CFG["vector"]["similarity_top_k"],
     )
 
+
+# ---- 补丁：流式持久化，避免大库写盘时内存翻倍 ----
+# SimpleKVStore.persist 原版是 f.write(json.dumps(...))——先在内存里拼出完整
+# JSON 字符串（大库可达数十 GB）再一次性写盘，持久化阶段极易 MemoryError。
+# 改为 json.dump(obj, f) 流式写入：写盘字节完全相同，但不再产生巨型字符串。
+import json as _json
+
+import fsspec as _fsspec
+from llama_index.core.storage.kvstore.simple_kvstore import SimpleKVStore as _SimpleKVStore
+
+
+def _streaming_kvstore_persist(self, persist_path, fs=None):
+    fs = fs or _fsspec.filesystem("file")
+    dirpath = os.path.dirname(persist_path)
+    if not fs.exists(dirpath):
+        fs.makedirs(dirpath)
+    with fs.open(persist_path, "w", encoding="utf-8") as f:
+        _json.dump(self._collections_mappings, f)
+
+
+_SimpleKVStore.persist = _streaming_kvstore_persist
 
 # ---- 配置（均可用环境变量覆盖，便于跨机器部署）----
 DATA_DIR = os.environ.get("DATA_DIR", r"D:\wiki\beijing_daily\2026-06-30")
@@ -601,6 +623,75 @@ def print_paged(text: str, page_lines: int = 40) -> None:
             except (EOFError, KeyboardInterrupt):
                 print("\n-- 已中断显示 --")
                 return
+
+
+# ---- 带超时的输入（用于 ingest 批次间确认）----
+def _input_with_timeout(prompt: str, timeout: float) -> str:
+    """
+    带超时的 input。超时返回空字符串。
+
+    跨平台策略：
+      - Windows: 用 msvcrt 逐键读取，可精确中断
+      - Unix: 用 select 监听 stdin
+      - 都不可用：回退到阻塞 input（无超时）
+
+    注意：非 tty 环境（IDE 捕获/管道）会立即返回空字符串，
+    避免在无法接收按键的场景下永久阻塞。
+    """
+    # 非 tty 环境（IDE 捕获/管道重定向）：无法接收用户按键，直接返回空字符串
+    # 让调用方按"超时自动继续"的语义处理
+    if not sys.stdin.isatty():
+        print(prompt, end="", flush=True)
+        print(f"\n[非交互环境] 自动继续...")
+        return ""
+
+    # Windows: msvcrt
+    if os.name == "nt":
+        try:
+            import msvcrt
+            import time
+            print(prompt, end="", flush=True)
+            start = time.time()
+            buf = []
+            while True:
+                # 检查键盘是否有输入
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch().decode("utf-8", errors="ignore")
+                    if ch in ("\r", "\n"):
+                        print()
+                        return "".join(buf)
+                    elif ch == "\x03":  # Ctrl+C
+                        raise KeyboardInterrupt
+                    elif ch == "\x08":  # Backspace
+                        if buf:
+                            buf.pop()
+                            print("\b \b", end="", flush=True)
+                    elif ch.isprintable():
+                        buf.append(ch)
+                        print(ch, end="", flush=True)
+                # 超时检查
+                if time.time() - start >= timeout:
+                    print(f"\n[超时] {timeout}秒未响应，自动继续...")
+                    return ""
+                time.sleep(0.05)
+        except ImportError:
+            pass  # msvcrt 不可用，回退到下面的 select / 阻塞 input
+
+    # Unix: select
+    try:
+        import select as _select
+        print(prompt, end="", flush=True)
+        rlist, _, _ = _select.select([sys.stdin], [], [], timeout)
+        if rlist:
+            return sys.stdin.readline().rstrip("\r\n")
+        print(f"\n[超时] {timeout}秒未响应，自动继续...")
+        return ""
+    except (ImportError, OSError):
+        # 最终回退：阻塞 input（无超时，但极少触发）
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return "q"
 
 
 # ---- 聚合查询：直遍 docstore（跳过向量检索）----
@@ -1191,22 +1282,33 @@ def _load_or_build_kb(kb_id: str, cfg: dict) -> VectorStoreIndex:
             print(f"    加载中（预计 {estimated_time:.0f}s）...")
 
         t0_load = time.time()
+        load_error = None
         try:
             storage_context = StorageContext.from_defaults(persist_dir=kb_storage)
             _check_embed_consistency(storage_context)
             index = load_index_from_storage(storage_context, index_id=INDEX_ID)
+        except Exception as e:
+            load_error = e
         finally:
             if is_tty:
                 stop_event.set()
                 pt.join()
 
-        elapsed = time.time() - t0_load
-        if is_tty:
-            sys.stdout.write(f"\r    加载进度: [{'█' * 30}] 100% | {elapsed:.1f}s\n")
-            sys.stdout.flush()
-        else:
-            print(f"    [OK] 加载完成，耗时 {elapsed:.1f}s")
-        return index
+        if load_error is None:
+            elapsed = time.time() - t0_load
+            if is_tty:
+                sys.stdout.write(f"\r    加载进度: [{'█' * 30}] 100% | {elapsed:.1f}s\n")
+                sys.stdout.flush()
+            else:
+                print(f"    [OK] 加载完成，耗时 {elapsed:.1f}s")
+            return index
+
+        # 索引文件损坏（如上次写盘被中断，留下 0 字节/截断的 JSON）：
+        # 与其崩溃，不如提示后重置为空库，用户重新 ingest 即可恢复。
+        print(f"\n[警告] 知识库 [{cfg.get('name', kb_id)}] 索引文件损坏（{type(load_error).__name__}: {load_error}）")
+        print(f"    已将 {kb_storage} 重置为空库，请重新 ingest 数据。")
+        import shutil
+        shutil.rmtree(kb_storage, ignore_errors=True)
 
     # 无索引：创建空索引，等待用户手动 ingest
     print(f"[空库] 知识库 [{cfg.get('name', kb_id)}] 暂无数据，已创建空索引")
@@ -1662,7 +1764,13 @@ def main() -> None:
                     reader = SimpleDirectoryReader(input_dir=str(path), required_exts=exts, recursive=True, filename_as_id=True)
                     exts_l = {e.lower() for e in exts}
                     total_files = sum(1 for p in Path(path).rglob("*") if p.is_file() and p.suffix.lower() in exts_l)
-                print(f"    -> 发现 {total_files} 个文件，逐文件加载并增量写入（哈希去重）...")
+                # 分批参数：从 retrieval_config.yaml 读取（可在配置文件中调整）
+                batch_size = _RETR_CFG["ingest"]["batch_size"]
+                auto_continue_timeout = _RETR_CFG["ingest"]["auto_continue_timeout"]
+                # 单文件路径时强制单批（避免无意义的暂停提示）
+                if path.is_file():
+                    batch_size = max(batch_size, total_files)
+                print(f"    -> 发现 {total_files} 个文件，分批处理（每批 {batch_size} 个），逐文件加载并增量写入（哈希去重）...")
                 pipeline = make_pipeline(index.storage_context)
                 size_before = get_storage_size(current_cfg["storage_dir"])
 
@@ -1690,6 +1798,13 @@ def main() -> None:
                 all_new_nodes = []
                 new_docs = 0
                 skipped = 0
+                total_nodes = 0
+                # 批次内统计（用于批次结束时的提示）
+                batch_new_docs = 0
+                batch_skipped = 0
+                batch_nodes = 0
+                batch_num = 0
+                user_aborted = False
                 i = 0
                 try:
                     for doc_batch in tqdm(reader.iter_data(), desc="ingest", unit="file", total=total_files, ncols=80, leave=False):
@@ -1698,21 +1813,65 @@ def main() -> None:
                             fname = (doc.metadata or {}).get("file_name", "") or doc.get_text()[:30]
                             new_nodes = pipeline.run(documents=[doc], show_progress=False)
                             all_new_nodes.extend(new_nodes)
+                            total_nodes += len(new_nodes)
+                            batch_nodes += len(new_nodes)
                             if new_nodes:
                                 new_docs += 1
+                                batch_new_docs += 1
                             else:
                                 skipped += 1
+                                batch_skipped += 1
                             tqdm.write(f"    [{i}/{total_files}] 处理: {fname}（产出 {len(new_nodes)} 节点）")
+                            # 批次边界：达到 batch_size 或最后一批
+                            # 持久化 + 交互式暂停（10秒超时自动继续）
+                            if i % batch_size == 0 or i >= total_files:
+                                is_last_batch = i >= total_files
+                                # 写索引 + 流式持久化（中断后重跑 ingest 会因哈希去重自动跳过已落盘的文件）
+                                if all_new_nodes:
+                                    index.insert_nodes(all_new_nodes)
+                                    all_new_nodes.clear()
+                                index.storage_context.persist(persist_dir=current_cfg["storage_dir"])
+                                if is_last_batch:
+                                    tqdm.write(f"    [批次 {batch_num + 1}] 前 {i}/{total_files} 个文件已落盘（最后一批）")
+                                    break
+                                # 中间批次：提示用户继续或退出
+                                batch_num += 1
+                                tqdm.write(
+                                    f"    [批次 {batch_num}] 已处理 {i}/{total_files} 个文件 "
+                                    f"（本批新增 {batch_new_docs}，跳过 {batch_skipped}，"
+                                    f"产出 {batch_nodes} 节点），剩余 {total_files - i} 个"
+                                )
+                                prompt = (
+                                    f"    按回车继续下一批，输入 q 退出 "
+                                    f"（{auto_continue_timeout}秒后自动继续）: "
+                                )
+                                choice = _input_with_timeout(prompt, auto_continue_timeout)
+                                if choice.strip().lower() in {"q", "quit", "退出"}:
+                                    print(f"    [已中断] 用户选择退出，已处理 {i}/{total_files} 个文件已落盘")
+                                    user_aborted = True
+                                    break
+                                # 重置批次统计
+                                batch_new_docs = 0
+                                batch_skipped = 0
+                                batch_nodes = 0
+                        if user_aborted or i >= total_files:
+                            break
                 finally:
                     object.__setattr__(docstore, "get_all_document_hashes", _orig_get_hashes)
                     object.__setattr__(docstore, "set_document_hash", _orig_set_hash)
+                # 最终持久化（处理未达批次边界的剩余节点 + 用户中途退出场景）
                 if all_new_nodes:
                     index.insert_nodes(all_new_nodes)
+                    all_new_nodes.clear()
                 index.storage_context.persist(persist_dir=current_cfg["storage_dir"])
                 hashes_after = len(index.storage_context.docstore.get_all_document_hashes())
                 size_after = get_storage_size(current_cfg["storage_dir"])
                 size_delta = size_after - size_before
-                print(f"    -> 完成！新增 {new_docs} 个文档（{len(all_new_nodes)} 个节点），跳过 {skipped} 个重复")
+                if user_aborted:
+                    print(f"    -> 已中止！本次处理 {i}/{total_files} 个文件，新增 {new_docs} 个文档（{total_nodes} 个节点），跳过 {skipped} 个重复")
+                    print(f"    -> 剩余 {total_files - i} 个文件未处理，下次重跑 ingest 会因哈希去重自动跳过已落盘文件")
+                else:
+                    print(f"    -> 完成！新增 {new_docs} 个文档（{total_nodes} 个节点），跳过 {skipped} 个重复")
                 print(f"    -> 已持久化到 {current_cfg['storage_dir']}，docstore 共跟踪 {hashes_after} 个唯一哈希")
                 print(f"    -> 存储容量: {format_size(size_after)}（本次 {'+' if size_delta >= 0 else ''}{format_size(size_delta)}）")
                 sys.stdout.flush()  # 确保终端输出完整，避免后续 input() 卡顿
