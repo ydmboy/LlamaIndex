@@ -21,3 +21,8 @@ highlight:
 ingest:
   batch_size: 1000              # 单批 ingest 最大文件数（大库分批处理，避免一次性内存压力）
   auto_continue_timeout: 10     # 每批结束后等待用户确认的秒数，超时自动继续下一批
+
+dedup:
+  simhash_enabled: true         # SimHash 近似转载拦截（同一文章被转载/不同文件同内容时跳过）
+  simhash_threshold: 3          # 64 位指纹的汉明距离阈值，<= 此值判为同一篇（调大更宽松、误杀增多）
+  simhash_min_chars: 8          # 正文归一化后短于此长度的不算 SimHash，只按精确哈希去重

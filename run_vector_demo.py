@@ -10,11 +10,13 @@
 切块、向量化，构建索引并持久化到 ./storage；之后启动若检测到 storage 存在则直接
 加载，实现"秒启动"。在 REPL 中输入问题即时获取回答，输入 exit/quit/退出 停止。
 
-去重原理：IngestionPipeline + DocstoreStrategy.DUPLICATES_ONLY
-  - 对每个文档计算 SHA256 内容哈希
-  - 哈希已存在于 docstore → 跳过（不切块、不向量化、不存储）
-  - 哈希不存在 → 切块、向量化、存入向量库 + 记录哈希
-  - 完全不依赖文档格式，通用且零误判
+去重原理（两道防线）：
+  1) SimHash 近似转载拦截：摄入前对正文归一化（NFKC+去标点空白）算 64 位内容指纹，
+     与库内指纹汉明距离 <= 3 即判为转载跳过——同一篇文章被不同报纸转载、
+     或同一内容存成不同文件（file_path 不同导致文档哈希必然不同）都能拦住。
+  2) IngestionPipeline + DocstoreStrategy.DUPLICATES_ONLY：对每个文档计算 SHA256
+     内容哈希，哈希已存在于 docstore → 跳过（不切块、不向量化、不存储）；
+     哈希不存在 → 切块、向量化、存入向量库 + 记录哈希。完全不依赖文档格式。
 """
 import logging
 import sys
@@ -22,6 +24,8 @@ import os
 import re
 import json
 import math
+import hashlib
+import unicodedata
 import numpy as np
 import torch
 from pathlib import Path
@@ -64,6 +68,7 @@ def _load_retrieval_config() -> dict:
         "chunk": {"chunk_size": 512, "chunk_overlap": 50},
         "highlight": {"top_n": 2, "threshold": 0.5},
         "ingest": {"batch_size": 1000, "auto_continue_timeout": 10},
+        "dedup": {"simhash_enabled": True, "simhash_threshold": 3, "simhash_min_chars": 8},
     }
     config_path = Path(RETRIEVAL_CONFIG_FILE)
     if not config_path.exists():
@@ -1047,6 +1052,243 @@ def _select_retrieval_mode() -> str:
         print(f"无效输入: {choice}，请输入 1-{len(mode_keys)} 的数字")
 
 
+# ---- SimHash 近似转载去重 ----
+# 背景：DocstoreStrategy.DUPLICATES_ONLY 用的 Document.hash 把 metadata（含 file_path）
+# 一并算进哈希——同一篇文章只要来自不同文件哈希就不同，报纸之间的转载完全拦不住。
+# 这里在摄入前对正文做内容指纹：NFKC 归一化 + 去标点空白 → 字符 bigram → 64 位 SimHash，
+# 汉明距离 <= 阈值（默认 3，retrieval_config.yaml 的 dedup 区可调）即判定为转载并跳过。
+# 指纹持久化到 <kb_storage>/simhash_fp.json（含被拦截转载的来源记录）；
+# 老库首次 ingest 时自动从 docstore 已有 chunk 重建指纹（一次性）。
+_SIMHASH_FILE = "simhash_fp.json"
+_SIMHASH_SEG_MASK = (1 << 16) - 1
+_SIMHASH_BIT_SHIFTS = np.arange(64, dtype=np.uint64)
+
+
+def _normalize_for_simhash(text: str) -> str:
+    """归一化正文：NFKC（全/半角、兼容字符统一）后去除所有非文字字符（标点/空白）。"""
+    return re.sub(r"[^\w]", "", unicodedata.normalize("NFKC", text))
+
+
+def _simhash64(norm_text: str, min_chars: int = 8):
+    """对归一化文本计算 64 位 SimHash（字符 bigram + blake2b，numpy 向量化投票）。
+    文本太短（bigram 数 < min_chars）时指纹不可靠，返回 None（调用方退化为精确哈希匹配）。"""
+    n = len(norm_text) - 1
+    if n < min_chars:
+        return None
+    hashes = np.fromiter(
+        (int.from_bytes(hashlib.blake2b(norm_text[i:i + 2].encode("utf-8"), digest_size=8).digest(), "little")
+         for i in range(n)),
+        dtype=np.uint64, count=n,
+    )
+    bits = (hashes[:, None] >> _SIMHASH_BIT_SHIFTS) & np.uint64(1)
+    votes = bits.sum(axis=0, dtype=np.int64) * 2 - n
+    fp = 0
+    for b in np.flatnonzero(votes > 0):
+        fp |= 1 << int(b)
+    return fp
+
+
+class _SimHashStore:
+    """SimHash 指纹库：内存索引 + JSON 持久化（每个知识库一个文件）。
+
+    查找用 4×16bit 分段索引：汉明距离 <=3 的两个 64 位指纹至少有一个 16 位段完全相同
+    （鸽笼原理），因此只需查 4 个段表取候选再精确算距离，开销与库规模近似无关。
+    每个指纹记录首发文件路径与被拦截的转载文件列表（dups），供统计和将来"来源合并"用。
+    文本过短的文档只按归一化精确哈希去重（short_docs）。
+    """
+
+    def __init__(self, path, threshold: int = 3, min_chars: int = 8):
+        self.path = Path(path)
+        self.threshold = threshold
+        self.min_chars = min_chars
+        self.entries = {}       # fp(int)         -> {"file_path", "exact", "dups": []}
+        self.short_docs = {}    # exact_hash(str) -> {"file_path", "dups": []}
+        self._exact_index = {}  # exact_hash -> fp
+        self._seg_tables = [{} for _ in range(4)]  # 段值 -> set(fp)
+
+    # ---- 内部 ----
+    @staticmethod
+    def _segments(fp: int) -> list:
+        return [(fp >> (16 * i)) & _SIMHASH_SEG_MASK for i in range(4)]
+
+    def _index_fp(self, fp: int) -> None:
+        for i, seg in enumerate(self._segments(fp)):
+            self._seg_tables[i].setdefault(seg, set()).add(fp)
+
+    @staticmethod
+    def _exact_hash(norm_text: str) -> str:
+        return hashlib.sha256(norm_text.encode("utf-8")).hexdigest()
+
+    # ---- 统计 ----
+    @property
+    def count(self) -> int:
+        return len(self.entries) + len(self.short_docs)
+
+    @property
+    def total_dups(self) -> int:
+        return sum(len(e["dups"]) for e in self.entries.values()) + \
+            sum(len(e["dups"]) for e in self.short_docs.values())
+
+    # ---- 持久化 ----
+    def load(self) -> None:
+        """从 JSON 加载并重建段索引。文件缺失=空库；损坏时警告后从空库开始（不阻断 ingest）。"""
+        if not self.path.exists():
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for fp_hex, e in (data.get("entries") or {}).items():
+                fp = int(fp_hex, 16)
+                e.setdefault("dups", [])
+                self.entries[fp] = e
+                self._exact_index[e.get("exact", "")] = fp
+                self._index_fp(fp)
+            for k, e in (data.get("short_docs") or {}).items():
+                e.setdefault("dups", [])
+                self.short_docs[k] = e
+        except Exception as ex:
+            print(f"[警告] SimHash 指纹库损坏（{type(ex).__name__}: {ex}），将从空库重新开始")
+            self.entries.clear()
+            self.short_docs.clear()
+            self._exact_index.clear()
+            self._seg_tables = [{} for _ in range(4)]
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "version": 1,
+            "threshold": self.threshold,
+            "min_chars": self.min_chars,
+            "entries": {format(fp, "016x"): e for fp, e in self.entries.items()},
+            "short_docs": self.short_docs,
+        }
+        tmp = self.path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, self.path)
+
+    # ---- 查重 / 入库 ----
+    def check_text(self, text: str):
+        """查重。返回 (matched_key, dist, kept_path)；无重复返回 (None, -1, "")。
+        matched_key 为命中的指纹（int）或短文档精确哈希（str），供 record_dup 使用。"""
+        norm = _normalize_for_simhash(text)
+        if not norm:
+            return None, -1, ""
+        exact = self._exact_hash(norm)
+        fp = self._exact_index.get(exact)
+        if fp is not None:
+            return fp, 0, self.entries[fp]["file_path"]
+        if exact in self.short_docs:
+            return exact, 0, self.short_docs[exact]["file_path"]
+        fp = _simhash64(norm, self.min_chars)
+        if fp is None:
+            return None, -1, ""
+        candidates = set()
+        for i, seg in enumerate(self._segments(fp)):
+            candidates |= self._seg_tables[i].get(seg, set())
+        best_fp, best_dist = None, -1
+        for cand in candidates:
+            d = bin(fp ^ cand).count("1")
+            if d <= self.threshold and (best_dist < 0 or d < best_dist):
+                best_fp, best_dist = cand, d
+        if best_fp is not None:
+            return best_fp, best_dist, self.entries[best_fp]["file_path"]
+        return None, -1, ""
+
+    def add_text(self, text: str, file_path: str) -> None:
+        """把已确认入库的文档写入指纹库。"""
+        norm = _normalize_for_simhash(text)
+        if not norm:
+            return
+        exact = self._exact_hash(norm)
+        fp = _simhash64(norm, self.min_chars)
+        if fp is None:
+            self.short_docs.setdefault(exact, {"file_path": file_path, "dups": []})
+            return
+        if fp in self.entries:
+            return
+        self.entries[fp] = {"file_path": file_path, "exact": exact, "dups": []}
+        self._exact_index[exact] = fp
+        self._index_fp(fp)
+
+    def record_dup(self, matched_key, dup_path: str) -> None:
+        """记录一次被拦截的转载（挂在被保留文章的 dups 列表上，上限 100 条防膨胀）。"""
+        entry = self.entries.get(matched_key)
+        if entry is None:
+            entry = self.short_docs.get(matched_key)
+        if entry is None or not dup_path:
+            return
+        if dup_path != entry["file_path"] and dup_path not in entry["dups"] and len(entry["dups"]) < 100:
+            entry["dups"].append(dup_path)
+
+
+def _bootstrap_simhash_from_docstore(docstore, store: _SimHashStore) -> int:
+    """老库升级：从 docstore 已有 chunk 重建文档级指纹（按 file_path 分组、沿 NEXT 链拼接）。
+    仅在指纹库为空且索引已有数据时执行一次，返回重建的文档数。"""
+    from llama_index.core.schema import NodeRelationship
+    by_file = {}
+    for node in docstore.docs.values():
+        fp = (node.metadata or {}).get("file_path")
+        if fp:
+            by_file.setdefault(fp, []).append(node)
+    for file_path, nodes in tqdm(by_file.items(), desc="重建转载指纹", unit="篇", ncols=80):
+        node_map = {n.node_id: n for n in nodes}
+
+        def _rel(n, rel):
+            info = (getattr(n, "relationships", {}) or {}).get(rel)
+            return getattr(info, "node_id", None)
+
+        heads = [n for n in nodes if _rel(n, NodeRelationship.PREVIOUS) not in node_map]
+        next_map = {n.node_id: _rel(n, NodeRelationship.NEXT) for n in nodes}
+        ordered, seen = [], set()
+        for head in heads:
+            cur = head.node_id
+            while cur in node_map and cur not in seen:
+                seen.add(cur)
+                ordered.append(node_map[cur])
+                cur = next_map.get(cur)
+        # NEXT 链缺失时退化为无序拼接，保证不丢内容（SimHash 对局部顺序不敏感）
+        ordered.extend(n for n in nodes if n.node_id not in seen)
+        store.add_text("".join(n.get_text() for n in ordered), file_path)
+    return len(by_file)
+
+
+def _get_simhash_store(storage_dir: str, docstore=None):
+    """按配置加载当前知识库的 SimHash 指纹库；老库首次使用自动从 docstore 重建指纹。
+    dedup.simhash_enabled=false 时返回 None。CLI 与 Web 共用。"""
+    dedup_cfg = _RETR_CFG.get("dedup", {})
+    if not dedup_cfg.get("simhash_enabled", True):
+        return None
+    store = _SimHashStore(
+        Path(storage_dir) / _SIMHASH_FILE,
+        threshold=dedup_cfg.get("simhash_threshold", 3),
+        min_chars=dedup_cfg.get("simhash_min_chars", 8),
+    )
+    store.load()
+    if store.count == 0 and docstore is not None and len(docstore.docs) > 0:
+        rebuilt = _bootstrap_simhash_from_docstore(docstore, store)
+        if rebuilt:
+            store.save()
+            print(f"    -> 已从现有索引重建 {rebuilt} 篇文章的转载指纹（一次性）")
+    return store
+
+
+def _filter_near_duplicates(documents: list, store: _SimHashStore):
+    """批量转载过滤（Web 摄入用）：返回 (保留文档, 被跳过的 [(doc, kept_path, dist)])。
+    保留文档的指纹立即写入 store，同批之内的转载也能拦截。"""
+    kept, skipped = [], []
+    for doc in documents:
+        text = doc.get_text()
+        key, dist, kept_path = store.check_text(text)
+        if key is not None:
+            store.record_dup(key, (doc.metadata or {}).get("file_path", ""))
+            skipped.append((doc, kept_path, dist))
+        else:
+            store.add_text(text, (doc.metadata or {}).get("file_path", ""))
+            kept.append(doc)
+    return kept, skipped
+
+
 # ---- IngestionPipeline 工厂函数 ----
 def make_pipeline(storage_context: StorageContext) -> IngestionPipeline:
     """
@@ -1562,7 +1804,8 @@ def main() -> None:
     print(f" 当前知识库: {current_cfg.get('name', current_kb_id)} [{current_kb_id}]")
     print(f" 存储位置:   {current_cfg['storage_dir']} ({format_size(kb_size)})")
     print(f" 检索模式:   {RETRIEVAL_MODES[current_mode]}")
-    print(" 去重: IngestionPipeline 哈希去重 (DUPLICATES_ONLY)")
+    _sh_status = "开" if _RETR_CFG["dedup"]["simhash_enabled"] else "关"
+    print(f" 去重: 哈希去重 (DUPLICATES_ONLY) + SimHash 转载拦截（{_sh_status}）")
     print(" 提示: 使用 ingest <路径> 添加文档到当前数据库")
     print("=" * 60)
     print("索引就绪。输入问题即可获取回答。")
@@ -1571,9 +1814,9 @@ def main() -> None:
     print("      kbs  -> 查看所有可用知识库（切换需重启程序）")
     print("      rebuild  -> 重建当前知识库索引")
     print("      embed <路径>  -> 向量化单个文件并打印结果（不写入主索引）")
-    print("      ingest <路径>  -> 把指定文件/文件夹增量加入当前知识库（自动去重）")
+    print("      ingest <路径>  -> 把指定文件/文件夹增量加入当前知识库（哈希+转载去重）")
     print("      list  -> 列出当前知识库中所有已 ingest 的文件路径")
-    print("      dedup_status  -> 查看去重统计（哈希数/文档数/跳过数）")
+    print("      dedup_status  -> 查看去重统计（哈希数/文档数/转载拦截数）")
     print("-" * 60)
     sys.stdout.flush()  # 确保终端输出完整，避免 input() 卡顿
 
@@ -1701,10 +1944,19 @@ def main() -> None:
                 print(f"  不同来源文件数:           {len(source_files)}")
                 print(f"  向量库中的向量数:          {vec_count}")
                 print(f"  存储目录总容量:            {format_size(get_storage_size(current_cfg['storage_dir']))}")
+                # SimHash 转载拦截统计（指纹库存在才显示）
+                fp_file = Path(current_cfg["storage_dir"]) / _SIMHASH_FILE
+                if fp_file.exists():
+                    sh_store = _SimHashStore(fp_file)
+                    sh_store.load()
+                    print("-" * 60)
+                    print(f"  SimHash 内容指纹数:        {sh_store.count}")
+                    print(f"  累计拦截转载:              {sh_store.total_dups}")
                 print("-" * 60)
                 print("说明：")
                 print("  - 唯一哈希 = 曾 ingest 过的去重后文档数")
                 print("  - 重复文档在 ingest 时被自动跳过，不会出现在上述计数中")
+                print("  - 转载拦截 = SimHash 内容指纹判定的近似转载（含不同文件的同文转载）")
                 print("  - 跳过数 = 历次 ingest 时输入文档数 - 新增哈希数（不累计）")
                 print("=" * 60)
             except Exception as e:
@@ -1770,9 +2022,14 @@ def main() -> None:
                 # 单文件路径时强制单批（避免无意义的暂停提示）
                 if path.is_file():
                     batch_size = max(batch_size, total_files)
-                print(f"    -> 发现 {total_files} 个文件，分批处理（每批 {batch_size} 个），逐文件加载并增量写入（哈希去重）...")
+                print(f"    -> 发现 {total_files} 个文件，分批处理（每批 {batch_size} 个），逐文件加载并增量写入（哈希+转载去重）...")
                 pipeline = make_pipeline(index.storage_context)
                 size_before = get_storage_size(current_cfg["storage_dir"])
+
+                # SimHash 近似转载拦截（报纸转载内容近乎相同，哈希去重拦不住，见 _SimHashStore 注释）
+                simhash_store = _get_simhash_store(current_cfg["storage_dir"], docstore=index.storage_context.docstore)
+                near_skipped = 0
+                batch_near_skipped = 0
 
                 # 提速关键：缓存全库哈希。llama-index 的 DUPLICATES_ONLY 在每次
                 # pipeline.run 时都全量重建哈希字典（O(已存条目数)），逐文档调用
@@ -1811,17 +2068,27 @@ def main() -> None:
                         for doc in doc_batch:
                             i += 1
                             fname = (doc.metadata or {}).get("file_name", "") or doc.get_text()[:30]
-                            new_nodes = pipeline.run(documents=[doc], show_progress=False)
-                            all_new_nodes.extend(new_nodes)
-                            total_nodes += len(new_nodes)
-                            batch_nodes += len(new_nodes)
-                            if new_nodes:
-                                new_docs += 1
-                                batch_new_docs += 1
+                            # SimHash 转载拦截：与库内已有文章内容近似（含归一化后精确一致）则跳过
+                            dup_key, dup_dist, dup_kept = simhash_store.check_text(doc.get_text()) if simhash_store is not None else (None, -1, "")
+                            if dup_key is not None:
+                                near_skipped += 1
+                                batch_near_skipped += 1
+                                simhash_store.record_dup(dup_key, (doc.metadata or {}).get("file_path", ""))
+                                tqdm.write(f"    [{i}/{total_files}] 跳过转载: {fname}（与 {Path(dup_kept).name or dup_kept} 内容重复，汉明距离={dup_dist}）")
                             else:
-                                skipped += 1
-                                batch_skipped += 1
-                            tqdm.write(f"    [{i}/{total_files}] 处理: {fname}（产出 {len(new_nodes)} 节点）")
+                                new_nodes = pipeline.run(documents=[doc], show_progress=False)
+                                all_new_nodes.extend(new_nodes)
+                                total_nodes += len(new_nodes)
+                                batch_nodes += len(new_nodes)
+                                if new_nodes:
+                                    new_docs += 1
+                                    batch_new_docs += 1
+                                    if simhash_store is not None:
+                                        simhash_store.add_text(doc.get_text(), (doc.metadata or {}).get("file_path", ""))
+                                else:
+                                    skipped += 1
+                                    batch_skipped += 1
+                                tqdm.write(f"    [{i}/{total_files}] 处理: {fname}（产出 {len(new_nodes)} 节点）")
                             # 批次边界：达到 batch_size 或最后一批
                             # 持久化 + 交互式暂停（10秒超时自动继续）
                             if i % batch_size == 0 or i >= total_files:
@@ -1831,6 +2098,8 @@ def main() -> None:
                                     index.insert_nodes(all_new_nodes)
                                     all_new_nodes.clear()
                                 index.storage_context.persist(persist_dir=current_cfg["storage_dir"])
+                                if simhash_store is not None:
+                                    simhash_store.save()
                                 if is_last_batch:
                                     tqdm.write(f"    [批次 {batch_num + 1}] 前 {i}/{total_files} 个文件已落盘（最后一批）")
                                     break
@@ -1838,7 +2107,7 @@ def main() -> None:
                                 batch_num += 1
                                 tqdm.write(
                                     f"    [批次 {batch_num}] 已处理 {i}/{total_files} 个文件 "
-                                    f"（本批新增 {batch_new_docs}，跳过 {batch_skipped}，"
+                                    f"（本批新增 {batch_new_docs}，跳过 {batch_skipped}，转载 {batch_near_skipped}，"
                                     f"产出 {batch_nodes} 节点），剩余 {total_files - i} 个"
                                 )
                                 prompt = (
@@ -1854,6 +2123,7 @@ def main() -> None:
                                 batch_new_docs = 0
                                 batch_skipped = 0
                                 batch_nodes = 0
+                                batch_near_skipped = 0
                         if user_aborted or i >= total_files:
                             break
                 finally:
@@ -1864,14 +2134,16 @@ def main() -> None:
                     index.insert_nodes(all_new_nodes)
                     all_new_nodes.clear()
                 index.storage_context.persist(persist_dir=current_cfg["storage_dir"])
+                if simhash_store is not None:
+                    simhash_store.save()
                 hashes_after = len(index.storage_context.docstore.get_all_document_hashes())
                 size_after = get_storage_size(current_cfg["storage_dir"])
                 size_delta = size_after - size_before
                 if user_aborted:
-                    print(f"    -> 已中止！本次处理 {i}/{total_files} 个文件，新增 {new_docs} 个文档（{total_nodes} 个节点），跳过 {skipped} 个重复")
-                    print(f"    -> 剩余 {total_files - i} 个文件未处理，下次重跑 ingest 会因哈希去重自动跳过已落盘文件")
+                    print(f"    -> 已中止！本次处理 {i}/{total_files} 个文件，新增 {new_docs} 个文档（{total_nodes} 个节点），跳过 {skipped} 个哈希重复、{near_skipped} 篇转载")
+                    print(f"    -> 剩余 {total_files - i} 个文件未处理，下次重跑 ingest 会因去重自动跳过已落盘文件")
                 else:
-                    print(f"    -> 完成！新增 {new_docs} 个文档（{total_nodes} 个节点），跳过 {skipped} 个重复")
+                    print(f"    -> 完成！新增 {new_docs} 个文档（{total_nodes} 个节点），跳过 {skipped} 个哈希重复、{near_skipped} 篇转载")
                 print(f"    -> 已持久化到 {current_cfg['storage_dir']}，docstore 共跟踪 {hashes_after} 个唯一哈希")
                 print(f"    -> 存储容量: {format_size(size_after)}（本次 {'+' if size_delta >= 0 else ''}{format_size(size_delta)}）")
                 sys.stdout.flush()  # 确保终端输出完整，避免后续 input() 卡顿

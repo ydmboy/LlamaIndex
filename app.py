@@ -35,6 +35,9 @@ from run_vector_demo import (
     make_pipeline,
     get_storage_size,
     format_size,
+    # 转载去重（SimHash）
+    _get_simhash_store,
+    _filter_near_duplicates,
     # 检索模式
     RETRIEVAL_MODES,
     _is_aggregate_query,
@@ -582,6 +585,16 @@ def _do_ingest(data_dir: str):
         )
         progress_bar.progress(50, text="向量化中 ...")
 
+        # 2.5) SimHash 转载过滤（与 CLI 共用同一套指纹库，近似转载直接跳过）
+        simhash_store = _get_simhash_store(
+            st.session_state.current_kb_cfg["storage_dir"],
+            docstore=storage_context.docstore,
+        )
+        near_dups = []
+        if simhash_store is not None:
+            documents, near_dups = _filter_near_duplicates(documents, simhash_store)
+            logs.append(f"  -> SimHash 转载过滤：拦截 {len(near_dups)} 篇，保留 {len(documents)} 篇")
+
         # 3) 运行 pipeline
         logs.append("[3/4] 运行 pipeline（切块 + 去重 + 向量化）...")
         status_text.text("[3/4] 切块 + 去重 + 向量化 ...")
@@ -594,6 +607,8 @@ def _do_ingest(data_dir: str):
         status_text.text("[4/4] 插入索引 + 保存 ...")
         st.session_state.index.insert_nodes(nodes)
         storage_context.persist(persist_dir=st.session_state.current_kb_cfg["storage_dir"])
+        if simhash_store is not None:
+            simhash_store.save()
 
         # 刷新 query_engine
         st.session_state.query_engine = _make_query_engine(st.session_state.index)
@@ -608,7 +623,7 @@ def _do_ingest(data_dir: str):
             "logs": logs,
         }
 
-        st.success(f"✅ Ingest 完成！处理 {len(documents)} 文档，生成 {len(nodes)} 节点，耗时 {elapsed:.1f}s")
+        st.success(f"✅ Ingest 完成！处理 {len(documents)} 文档（拦截转载 {len(near_dups)} 篇），生成 {len(nodes)} 节点，耗时 {elapsed:.1f}s")
 
     except Exception as e:
         progress_bar.progress(100, text="失败")
