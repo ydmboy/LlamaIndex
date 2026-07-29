@@ -46,6 +46,10 @@ from llama_index.llms.deepseek import DeepSeek
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from tqdm import tqdm
 
+# Faiss 向量存储后端（替换默认 SimpleVectorStore，解决大库 JSON 加载慢/内存爆问题）
+import faiss
+from llama_index.vector_stores.faiss import FaissVectorStore
+
 # LLM 提供商可选（按需导入，避免无用依赖报错）
 try:
     from llama_index.llms.openai_like import OpenAILike
@@ -102,6 +106,10 @@ def _make_query_engine(index):
 # SimpleKVStore.persist 原版是 f.write(json.dumps(...))——先在内存里拼出完整
 # JSON 字符串（大库可达数十 GB）再一次性写盘，持久化阶段极易 MemoryError。
 # 改为 json.dump(obj, f) 流式写入：写盘字节完全相同，但不再产生巨型字符串。
+#
+# 注意：此补丁仅对 SimpleKVStore 生效（docstore.json / index_store.json）。
+# 向量存储已切换到 FaissVectorStore（二进制 .faiss 文件），不走 SimpleKVStore。
+# LlamaIndex 0.14.x 无官方 SQLite docstore 后端，docstore 暂仍用 JSON。
 import json as _json
 
 import fsspec as _fsspec
@@ -371,16 +379,28 @@ def _check_embed_consistency(storage_context: StorageContext) -> bool:
 
     返回 True 表示一致，False 表示不一致（调用方应提示用户 rebuild）。
     避免查询时 NumPy 报 inhomogeneous shape 错误。
-    """
-    try:
-        emb_dict = storage_context.vector_store.data.embedding_dict
-    except AttributeError:
-        return True  # 无法访问，跳过检查
-    if not emb_dict:
-        return True  # 空索引，无需检查
 
-    # 采样第一个向量的维度作为存储维度
-    stored_dim = len(next(iter(emb_dict.values())))
+    适配 FaissVectorStore：通过 client.ntotal 获取向量数、client.d 获取维度。
+    同时兼容旧的 SimpleVectorStore（.data.embedding_dict）。
+    """
+    vector_store = storage_context.vector_store
+
+    # 优先走 FaissVectorStore 路径
+    try:
+        faiss_client = vector_store.client
+        if faiss_client.ntotal == 0:
+            return True  # 空索引，无需检查
+        stored_dim = faiss_client.d
+    except AttributeError:
+        # 回退到 SimpleVectorStore 旧路径（兼容性）
+        try:
+            emb_dict = vector_store.data.embedding_dict
+        except AttributeError:
+            return True  # 无法访问，跳过检查
+        if not emb_dict:
+            return True  # 空索引，无需检查
+        stored_dim = len(next(iter(emb_dict.values())))
+
     expected_dim = _get_embed_dim()
     if stored_dim != expected_dim:
         print(
@@ -1289,6 +1309,62 @@ def _filter_near_duplicates(documents: list, store: _SimHashStore):
     return kept, skipped
 
 
+# ---- 存储后端工厂（FaissVectorStore + SimpleDocumentStore）----
+# 向量存储用 Faiss IndexHNSWFlat（二进制，加载快、查询快），
+# docstore/index_store 仍用 LlamaIndex 默认的 Simple 系列（JSON）。
+# LlamaIndex 0.14.x 无官方 SQLite docstore 后端，故 docstore 暂保留 JSON。
+
+FAISS_INDEX_FILENAME = "default__vector_store.faiss"
+
+
+def _get_faiss_index_path(storage_dir: str) -> str:
+    """返回 faiss 索引文件路径。"""
+    return os.path.join(storage_dir, FAISS_INDEX_FILENAME)
+
+
+def _make_storage_context(storage_dir: str, embed_dim: int) -> StorageContext:
+    """
+    创建使用 FaissVectorStore 的 StorageContext。
+
+    - 存在已持久化的 faiss 索引文件 → 加载之
+    - 不存在 → 新建空 IndexHNSWFlat（M=32, efConstruction=40, efSearch=16）
+
+    注意：docstore/index_store 由 StorageContext.from_defaults 自动用 Simple 系列，
+    仍生成 docstore.json / index_store.json（由流式持久化补丁优化写盘）。
+    """
+    faiss_path = _get_faiss_index_path(storage_dir)
+
+    if os.path.exists(faiss_path):
+        # 加载已有 faiss 索引
+        vector_store = FaissVectorStore.from_persist_path(faiss_path)
+    else:
+        # 新建空 faiss 索引（IndexHNSWFlat：图索引，查询最快）
+        # M=32 是 HNSW 的连通性参数，越大精度越高、内存越大
+        # efConstruction=40 构建时搜索深度，efSearch=16 查询时搜索深度
+        faiss_index = faiss.IndexHNSWFlat(embed_dim, 32)
+        faiss_index.hnsw.efConstruction = 40
+        faiss_index.hnsw.efSearch = 16
+        vector_store = FaissVectorStore(faiss_index=faiss_index)
+
+    # docstore/index_store 仍用 Simple 系列（StorageContext.from_defaults 默认），
+    # 但显式传入 vector_store 以覆盖默认的 SimpleVectorStore
+    return StorageContext.from_defaults(
+        vector_store=vector_store,
+    )
+
+
+def _persist_storage(index, storage_dir: str) -> None:
+    """
+    统一持久化：faiss 索引（.faiss 二进制）+ docstore/index_store（JSON）。
+
+    FaissVectorStore 自己管理 .faiss 文件的持久化，需单独调用 persist()。
+    storage_context.persist() 负责 docstore.json / index_store.json 的持久化。
+    """
+    faiss_path = _get_faiss_index_path(storage_dir)
+    index.vector_store.persist(faiss_path)
+    index.storage_context.persist(persist_dir=storage_dir)
+
+
 # ---- IngestionPipeline 工厂函数 ----
 def make_pipeline(storage_context: StorageContext) -> IngestionPipeline:
     """
@@ -1526,7 +1602,7 @@ def _load_or_build_kb(kb_id: str, cfg: dict) -> VectorStoreIndex:
         t0_load = time.time()
         load_error = None
         try:
-            storage_context = StorageContext.from_defaults(persist_dir=kb_storage)
+            storage_context = _make_storage_context(kb_storage, _get_embed_dim())
             _check_embed_consistency(storage_context)
             index = load_index_from_storage(storage_context, index_id=INDEX_ID)
         except Exception as e:
@@ -1556,11 +1632,11 @@ def _load_or_build_kb(kb_id: str, cfg: dict) -> VectorStoreIndex:
     print(f"[空库] 知识库 [{cfg.get('name', kb_id)}] 暂无数据，已创建空索引")
     print(f"    存储到: {kb_storage}")
     print(f"    使用 ingest <路径> 命令添加文档")
-    storage_context = StorageContext.from_defaults()
+    Path(kb_storage).mkdir(parents=True, exist_ok=True)
+    storage_context = _make_storage_context(kb_storage, _get_embed_dim())
     index = VectorStoreIndex(nodes=[], storage_context=storage_context)
     index.set_index_id(INDEX_ID)
-    Path(kb_storage).mkdir(parents=True, exist_ok=True)
-    index.storage_context.persist(kb_storage)
+    _persist_storage(index, kb_storage)
     sys.stdout.flush()
     return index
 
@@ -1569,7 +1645,7 @@ def load_or_build_index() -> VectorStoreIndex:
     """若 ./storage 已存在则直接加载；否则读数据源文档，经 IngestionPipeline 去重+向量化后构建并持久化。"""
     if Path(STORAGE_DIR).exists() and (Path(STORAGE_DIR) / "docstore.json").exists():
         print(f"[加载] 从 {STORAGE_DIR} 读取已持久化的索引 ...")
-        storage_context = StorageContext.from_defaults(persist_dir=STORAGE_DIR)
+        storage_context = _make_storage_context(STORAGE_DIR, _get_embed_dim())
         _check_embed_consistency(storage_context)  # 维度不一致则直接退出
         return load_index_from_storage(storage_context, index_id=INDEX_ID)
 
@@ -1590,7 +1666,8 @@ def load_or_build_index() -> VectorStoreIndex:
         print(f"    [调试] MAX_DOCS={max_docs}：只处理前 {max_docs} 个文档（共 {len(documents)} 个）")
         documents = documents[:max_docs]
 
-    storage_context = StorageContext.from_defaults()
+    Path(STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+    storage_context = _make_storage_context(STORAGE_DIR, _get_embed_dim())
     pipeline = make_pipeline(storage_context)
 
     print(f"[构建] 运行 IngestionPipeline（哈希去重 + 切块 + 向量化）...")
@@ -1603,7 +1680,7 @@ def load_or_build_index() -> VectorStoreIndex:
         storage_context=storage_context,
     )
     index.set_index_id(INDEX_ID)
-    index.storage_context.persist(STORAGE_DIR)
+    _persist_storage(index, STORAGE_DIR)
     total_size = get_storage_size(STORAGE_DIR)
     print(f"    -> 索引已持久化到 {STORAGE_DIR}，下次启动将直接加载")
     print(f"    -> 输入 {len(documents)} 个文档，产出 {len(nodes)} 个节点，docstore 共跟踪 {hashes_after} 个唯一哈希")
@@ -1887,10 +1964,12 @@ def main() -> None:
                 exists = Path(cfg["storage_dir"]).exists() and (Path(cfg["storage_dir"]) / "docstore.json").exists()
                 if exists:
                     size = format_size(get_storage_size(cfg["storage_dir"]))
-                    # 尝试获取节点数
+                    # 只加载 docstore.json 统计节点数（不加载 faiss 索引，避免大库加载慢）
                     try:
-                        sc = StorageContext.from_defaults(persist_dir=cfg["storage_dir"])
-                        node_count = len(sc.docstore.docs)
+                        from llama_index.core.storage.docstore import SimpleDocumentStore
+                        docstore_path = os.path.join(cfg["storage_dir"], "docstore.json")
+                        ds = SimpleDocumentStore.from_persist_path(docstore_path)
+                        node_count = len(ds.docs)
                     except Exception:
                         node_count = "?"
                 else:
@@ -1936,7 +2015,7 @@ def main() -> None:
                     fp = (node.metadata or {}).get("file_path", "未知")
                     source_files.add(fp)
                 try:
-                    vec_count = len(index.vector_store.data.embedding_dict)
+                    vec_count = index.vector_store.client.ntotal
                 except Exception:
                     vec_count = "?"
                 print(f"  docstore 跟踪的唯一哈希数: {len(all_hashes)}")
@@ -2097,7 +2176,7 @@ def main() -> None:
                                 if all_new_nodes:
                                     index.insert_nodes(all_new_nodes)
                                     all_new_nodes.clear()
-                                index.storage_context.persist(persist_dir=current_cfg["storage_dir"])
+                                _persist_storage(index, current_cfg["storage_dir"])
                                 if simhash_store is not None:
                                     simhash_store.save()
                                 if is_last_batch:
@@ -2133,7 +2212,7 @@ def main() -> None:
                 if all_new_nodes:
                     index.insert_nodes(all_new_nodes)
                     all_new_nodes.clear()
-                index.storage_context.persist(persist_dir=current_cfg["storage_dir"])
+                _persist_storage(index, current_cfg["storage_dir"])
                 if simhash_store is not None:
                     simhash_store.save()
                 hashes_after = len(index.storage_context.docstore.get_all_document_hashes())
@@ -2165,7 +2244,7 @@ def main() -> None:
                         seen.add(fp)
                         file_list.append(fp)
                 try:
-                    vec_count = len(index.vector_store.data.embedding_dict)
+                    vec_count = index.vector_store.client.ntotal
                 except Exception:
                     vec_count = "?"
                 parts = [

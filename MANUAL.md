@@ -18,7 +18,7 @@
   → IngestionPipeline（SHA256 文档级哈希去重，重复跳过）
   → SentenceSplitter 切块（chunk=512, overlap=50）
   → HuggingFaceEmbedding 向量化（本地 bge-m3，FP16/GPU）
-  → SimpleVectorStore + SimpleDocumentStore 持久化到 ./storage/<kb_id>/
+  → FaissVectorStore（HNSW 图索引，二进制 .faiss）+ SimpleDocumentStore（JSON）持久化到 ./storage/<kb_id>/
 ```
 
 ### 核心组件
@@ -28,7 +28,8 @@
 | LLM | 启动时五选一：DeepSeek（默认）/ 通义千问 / 智谱 GLM / Ollama / 自定义 OpenAI 兼容 |
 | Embedding | `models/bge-m3`（1024 维，FP16，GPU），启动时可改选 |
 | 切块 | `SentenceSplitter` chunk_size=512, overlap=50 |
-| 向量库/文档库 | `SimpleVectorStore` + `SimpleDocumentStore`，JSON 持久化，每库独立 |
+| 向量库 | `FaissVectorStore`（IndexHNSWFlat M=32, efSearch=16），二进制 `.faiss` 持久化，加载快、查询快 |
+| 文档库/索引库 | `SimpleDocumentStore` + `SimpleIndexStore`，JSON 持久化（每库独立） |
 | 去重 | `IngestionPipeline` + `DocstoreStrategy.DUPLICATES_ONLY`（文档级 SHA256） |
 | 检索 | 向量检索（默认）/ 聚合直遍 / 全文搜索（BM25），运行中 `mode` 切换 |
 | 高亮 | 检索片段内自动高亮重点句（本地 embedding 余弦相似度，纯展示层） |
@@ -37,10 +38,11 @@
 
 ## 二、环境与本机部署状态
 
-### 本机已部署完成（2026-07-23 实测通过）
+### 本机已部署完成（2026-07-23 实测通过，2026-07-29 更新 Faiss 后端）
 
 - `.venv`：Python 3.11.15
 - `torch 2.7.1+cu128`：**注意不是手册旧版写的 2.5.1+cu121**。RTX 5060 是 Blackwell 架构（sm_120），cu121 版实测报 `no kernel image is available`，无法运算；cu128 版已实测 FP16 GPU 矩阵运算正常
+- `faiss-cpu 1.14.3` + `llama-index-vector-stores-faiss 0.6.0`：向量存储后端（替换默认 SimpleVectorStore）
 - `models/bge-m3/`：2.27 GB（主权重为 `pytorch_model.bin`，该仓库**没有** safetensors 文件）
 - `requirements.txt` 全部依赖已安装，版本与清单一致
 
@@ -53,6 +55,8 @@ uv venv .venv --python 3.11
 # NVIDIA 显卡（RTX 50 系必须 cu128；老显卡可改用 cu121 源装 torch==2.5.1）
 uv pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 uv pip install -r requirements.txt
+# Faiss 向量存储后端（requirements.txt 已包含，此处显式说明）
+uv pip install faiss-cpu llama-index-vector-stores-faiss
 # 下载 bge-m3 模型（约 2.3GB；也可 python download_models.py）
 uv run --with huggingface-hub python -c "from huggingface_hub import snapshot_download; snapshot_download('BAAI/bge-m3', local_dir='models/bge-m3', ignore_patterns=['*.h5','*.msgpack','onnx/*','openvino/*'])"
 ```
@@ -113,7 +117,12 @@ file_exts: [".md", ".txt"]
 ```
 
 - `*.yaml.example` 不会被加载，只有 `*.yaml` 生效
-- 每库索引独立存于 `storage/<kb_id>/`（docstore.json / index_store.json / vector_store.json）
+- 每库索引独立存于 `storage/<kb_id>/`，包含以下文件：
+  - `default__vector_store.faiss` — Faiss 二进制向量索引（HNSW 图，加载快、查询快）
+  - `docstore.json` — 文档/节点内容 + SHA256 哈希（去重关键）
+  - `index_store.json` — 索引结构元信息
+  - `default__vector_store.json` — FaissVectorStore 元数据（很小）
+  - `image__vector_store.json` / `graph_store.json` — 空（未使用）
 - `storage_dir` 字段留空则自动用 `./storage/<kb_id>`；`data_dir` 可不填（空库靠 ingest）
 
 ---
@@ -149,7 +158,7 @@ file_exts: [".md", ".txt"]
 
 ### rebuild 注意
 
-无确认、立即删除 `storage/<当前库>` 并重建空索引。换 embedding 模型后必须 rebuild（维度不同，系统启动时会校验并拦截不一致的 ingest）。
+无确认、立即删除 `storage/<当前库>` 并重建空索引。换 embedding 模型后必须 rebuild（维度不同，系统启动时会校验并拦截不一致的 ingest）。从旧 SimpleVectorStore 迁移到 FaissVectorStore 后也必须 rebuild（JSON 向量格式与 Faiss 二进制格式不互通）。
 
 ---
 
@@ -232,6 +241,18 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | 由 `retrieval_config.yaml` 控制 | 切块参数（默认 512/50） |
 | `HIGHLIGHT_TOP_N` / `HIGHLIGHT_THRESHOLD` | 由 `retrieval_config.yaml` 控制 | 重点句高亮参数（默认 2/0.5） |
 | `PAGER_THRESHOLD_LINES` | 30 | 超过此行数触发分页 |
+| `FAISS_INDEX_FILENAME` | `default__vector_store.faiss` | Faiss 索引文件名 |
+
+### Faiss 向量存储参数（`_make_storage_context` 函数）
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 索引类型 | `IndexHNSWFlat` | 图索引，查询最快（1-10ms/百万向量） |
+| `M` | 32 | HNSW 连通性参数，越大精度越高、内存越大 |
+| `efConstruction` | 40 | 构建时搜索深度 |
+| `efSearch` | 16 | 查询时搜索深度 |
+
+> 这些参数在 `run_vector_demo.py` 的 `_make_storage_context()` 函数中硬编码。如需调优（如换 `IndexFlatL2` 精确检索、或调大 `efSearch` 提升召回率），直接改该函数。
 
 ### 高亮样式（`highlight_config.json`）
 
@@ -247,14 +268,15 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 2. `IngestionPipeline` 算文档 SHA256，重复直接跳过
 3. `SentenceSplitter` 按句子边界切块
 4. bge-m3 把 chunk 转成 1024 维向量
-5. `SimpleVectorStore` 暴力余弦检索
+5. `FaissVectorStore`（IndexHNSWFlat）图检索，O(log N) 近似最近邻
 6. 按 `similarity_top_k`（当前 10）取片段交 LLM 生成回答
 7. 展示层：本地 embedding 在片段内找 top-N 相似句高亮（不改变检索结果）
 
 ### 哈希去重
 
 - **文档级**：一个文件 = 一个文档，整体 SHA256。内容完全相同的文件才会跳过；部分重叠（转载）不算重复，会都入库
-- 哈希映射持久化在 `docstore.json`，重启后仍记得
+- 哈希映射持久化在 `docstore.json`（SimpleDocumentStore JSON 格式），重启后仍记得
+- 向量数据存储在 `default__vector_store.faiss`（Faiss 二进制格式），与 docstore 分离
 - 不会做的事：不标签化、不分类、不解析结构、不语义去重（"略改的转载"识别不了）
 
 ---
@@ -267,8 +289,14 @@ $env:STREAMLIT_HOME="c:\code\LlamaIndex\.streamlit"
 **Q：只有向量模式没反应/报错？**
 向量模式的回答生成需要有效的 LLM API Key 且能访问对应 API。聚合和全文模式不依赖 LLM，可无网使用。
 
-**Q：大批量 ingest 越到后来越慢 / 最后写盘时 MemoryError？**
-旧版有三个问题，均已修复：① 每处理一个文件都全量重建去重哈希表（总开销 O(N²)），几千文件后明显变慢——已改为哈希缓存，每次检查 O(1)；② 一次性把全部语料读入内存——已改为逐文件惰性读取；③ 持久化用 `json.dumps` 在内存拼完整字符串（大库达数十 GB）再写盘，最后阶段极易内存耗尽——已改为 `json.dump` 流式写盘，内存不再翻倍（`app.py` 经 import 自动生效）。此外 **ingest 每 1000 个文件自动落盘一个检查点**，中断/崩溃后重新执行同一 ingest 命令，哈希去重会自动跳过已落盘的文件，相当于断点续传。
+**Q：大批量 ingest 越到后越慢 / 最后写盘时 MemoryError？**
+已有四重优化：① 哈希缓存，每次去重检查 O(1)；② 逐文件惰性读取，不全量加载；③ `json.dump` 流式写盘（docstore.json），内存不翻倍；④ **向量存储已切换到 FaissVectorStore**（二进制 `.faiss` 文件，加载快、查询快）。此外 **ingest 每 1000 个文件自动落盘一个检查点**（`retrieval_config.yaml` 的 `ingest.batch_size` 可调），中断/崩溃后重新执行同一 ingest 命令，哈希去重会自动跳过已落盘的文件，相当于断点续传。
+
+**Q：旧索引（SimpleVectorStore JSON 格式）如何迁移到 Faiss？**
+不兼容直接迁移。旧格式（`default__vector_store.json`）与新格式（`default__vector_store.faiss`）不互通。执行 `rebuild` 命令清空当前库后重新 ingest 即可。旧索引备份在 `storage/<kb_id>_backup_json/`（如存在），确认新索引正常后可删除。
+
+**Q：Faiss 索引类型能换吗？**
+能。`run_vector_demo.py` 的 `_make_storage_context()` 函数里硬编码了 `IndexHNSWFlat`（M=32, efConstruction=40, efSearch=16）。如需精确检索换 `IndexFlatL2`，或需更小内存换 `IndexIVFFlat`，直接改该函数。换索引类型后必须 `rebuild` 重建。
 
 **Q：RTX 50 系显卡报 `no kernel image is available for execution on the device`**
 torch 版本太旧（sm_120 需要 cu128 构建）：`uv pip install --reinstall-package torch torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128`
@@ -310,11 +338,12 @@ LlamaIndex/
 ├── kb_configs/               # 库配置：code / knowledge / newspaper 三个生效
 │   └── *.yaml.example        # 模板（不生效）
 ├── models/bge-m3/            # 本地 embedding 模型（2.27GB）
-├── storage/<kb_id>/          # 各库索引（docstore.json / index_store.json / vector_store.json）
+├── storage/<kb_id>/          # 各库索引（.faiss 向量索引 + docstore.json + index_store.json）
+├── storage/<kb_id>_backup_json/  # 旧 JSON 索引备份（迁移 Faiss 时自动生成，确认后可删）
 └── _deploy_pkg/              # 部署包（deploy.ps1 等；torch 版本与模型检查已过时，勿直接重跑）
 ```
 
-`docstore.json` 是去重的关键：记录所有已 ingest 文档/节点的 SHA256 哈希。删除它会导致去重记忆丢失。
+`docstore.json` 是去重的关键：记录所有已 ingest 文档/节点的 SHA256 哈希。删除它会导致去重记忆丢失。`default__vector_store.faiss` 是 Faiss 二进制向量索引，包含所有向量数据和 HNSW 图结构。
 
 ---
 

@@ -5,6 +5,10 @@ llama-index-llms-deepseek==0.3.0
 llama-index-llms-ollama==0.10.1
 llama-index-llms-openai==0.6.26
 llama-index-readers-file==0.6.0
+llama-index-vector-stores-faiss>=0.6.0  # Faiss 向量存储后端（替换 SimpleVectorStore）
+
+# ===== 向量检索引擎 =====
+faiss-cpu>=1.14.0
 
 # ===== Embedding 模型栈 =====
 sentence-transformers==5.6.0
