@@ -43,6 +43,16 @@ if (-not (Test-Path $modelDir) -or -not (Test-Path "$modelDir\model.safetensors"
     Write-Host "bge-m3 模型已存在，跳过下载" -ForegroundColor Green
 }
 
+# 8) 检查 Docker（向量库 server 模式用 qdrant 容器，程序启动时自动拉取镜像/创建容器）
+$docker = Get-Command docker -ErrorAction SilentlyContinue
+if (-not $docker) {
+    Write-Host ""
+    Write-Host "警告：未检测到 docker。向量库 server 模式需要 Docker Desktop；" -ForegroundColor Yellow
+    Write-Host "      请先安装 Docker Desktop，或运行时设 `$env:QDRANT_MODE=`"local`" 回退内嵌模式（大库启动慢）。" -ForegroundColor Yellow
+} else {
+    Write-Host "docker 已检测到，qdrant 容器将在程序首次启动时自动创建" -ForegroundColor Green
+}
+
 Write-Host ""
 Write-Host "===== 部署完成 =====" -ForegroundColor Green
 Write-Host ""

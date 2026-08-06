@@ -18,8 +18,9 @@ LlamaIndex RAG 系统 — 部署说明
   3. powershell -ExecutionPolicy Bypass -File _deploy_pkg\deploy.ps1
      脚本会自动：
        创建 .venv → 安装 uv → 装 torch GPU 版 → 装其余依赖
-       → 验证 CUDA → 下载 bge-m3 模型（约 4.25 GB）
+       → 验证 CUDA → 下载 bge-m3 模型（约 4.25 GB）→ 检查 docker
   4. 首次部署需联网下载约 7 GB（torch 2.5GB + 模型权重 4.25GB + 依赖包）
+     另需安装 Docker Desktop（向量库 qdrant 以容器运行，程序启动时自动拉取镜像）
 
 二、运行
   # 设置环境变量
@@ -70,6 +71,10 @@ LlamaIndex RAG 系统 — 部署说明
 七、注意事项
   - torch 为 GPU 版(cu121)，需 NVIDIA 显卡；无 GPU 改装 CPU 版：
       uv pip install torch==2.5.1
+  - 向量库为 qdrant server 模式：程序启动时自动拉起 Docker 容器 llamaindex-qdrant
+    （需要 Docker Desktop；只绑定 127.0.0.1:16333，不弹防火墙）；
+    数据在 Docker volume llamaindex-qdrant-data。勿改用 qdrant Windows 裸 exe
+    （其删除/段合并 rename 有 bug，写入负载下会泄漏段文件耗尽磁盘）
   - 首次启动选择数据库后为空库，需用 ingest 添加文档
   - DEEPSEEK_API_KEY 请勿写入文件，用环境变量传递
   - embedding 模型不在 git 中，由 deploy.ps1 或 download_models.py 下载

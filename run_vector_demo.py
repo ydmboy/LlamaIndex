@@ -26,6 +26,8 @@ import json
 import math
 import hashlib
 import unicodedata
+import shutil
+import subprocess
 import numpy as np
 import torch
 from pathlib import Path
@@ -46,9 +48,15 @@ from llama_index.llms.deepseek import DeepSeek
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from tqdm import tqdm
 
-# Faiss 向量存储后端（替换默认 SimpleVectorStore，解决大库 JSON 加载慢/内存爆问题）
-import faiss
-from llama_index.vector_stores.faiss import FaissVectorStore
+# Qdrant 向量存储（默认 server 模式：本机 qdrant.exe 自动拉起，on_disk mmap 按需读盘；
+# QDRANT_MODE=local 回退旧的内嵌模式）
+# + 自研 SQLite KVStore（docstore/index_store 后端，替代 JSON 全量加载/重写）
+import qdrant_client
+from qdrant_client.http import models as qdrant_models
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.core.storage.docstore.keyval_docstore import KVDocumentStore
+from llama_index.core.storage.index_store.keyval_index_store import KVIndexStore
+from sqlite_kvstore import SQLiteKVStore
 
 # LLM 提供商可选（按需导入，避免无用依赖报错）
 try:
@@ -71,7 +79,7 @@ def _load_retrieval_config() -> dict:
         "fulltext": {"top_k": 20, "bm25_k1": 1.5, "bm25_b": 0.75},
         "chunk": {"chunk_size": 512, "chunk_overlap": 50},
         "highlight": {"top_n": 2, "threshold": 0.5},
-        "ingest": {"batch_size": 1000, "auto_continue_timeout": 10},
+        "ingest": {"batch_size": 200, "doc_batch_size": 32, "auto_continue_timeout": 10},
         "dedup": {"simhash_enabled": True, "simhash_threshold": 3, "simhash_min_chars": 8},
     }
     config_path = Path(RETRIEVAL_CONFIG_FILE)
@@ -102,30 +110,9 @@ def _make_query_engine(index):
     )
 
 
-# ---- 补丁：流式持久化，避免大库写盘时内存翻倍 ----
-# SimpleKVStore.persist 原版是 f.write(json.dumps(...))——先在内存里拼出完整
-# JSON 字符串（大库可达数十 GB）再一次性写盘，持久化阶段极易 MemoryError。
-# 改为 json.dump(obj, f) 流式写入：写盘字节完全相同，但不再产生巨型字符串。
-#
-# 注意：此补丁仅对 SimpleKVStore 生效（docstore.json / index_store.json）。
-# 向量存储已切换到 FaissVectorStore（二进制 .faiss 文件），不走 SimpleKVStore。
-# LlamaIndex 0.14.x 无官方 SQLite docstore 后端，docstore 暂仍用 JSON。
-import json as _json
-
-import fsspec as _fsspec
-from llama_index.core.storage.kvstore.simple_kvstore import SimpleKVStore as _SimpleKVStore
-
-
-def _streaming_kvstore_persist(self, persist_path, fs=None):
-    fs = fs or _fsspec.filesystem("file")
-    dirpath = os.path.dirname(persist_path)
-    if not fs.exists(dirpath):
-        fs.makedirs(dirpath)
-    with fs.open(persist_path, "w", encoding="utf-8") as f:
-        _json.dump(self._collections_mappings, f)
-
-
-_SimpleKVStore.persist = _streaming_kvstore_persist
+# 注：SimpleKVStore 流式/原子持久化补丁已随 JSON docstore 一起退役。
+# 现存储后端：Qdrant（向量，WAL 持续落盘）+ SQLiteKVStore（docstore/index_store，
+# 事务原子提交），崩溃安全由两者自身机制保证，见 _make_storage_context/_persist_storage。
 
 # ---- 配置（均可用环境变量覆盖，便于跨机器部署）----
 DATA_DIR = os.environ.get("DATA_DIR", r"D:\wiki\beijing_daily\2026-06-30")
@@ -252,7 +239,7 @@ def _build_llm(provider: str):
 
 # 本地模型搜索位置
 _LOCAL_MODEL_DIRS = [
-    r"C:\code\LlamaIndex\models",            # 项目内本地模型
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),  # 项目内本地模型
     os.path.expanduser("~/.cache/huggingface/hub"),  # HF 缓存
 ]
 
@@ -378,28 +365,28 @@ def _check_embed_consistency(storage_context: StorageContext) -> bool:
     校验现有索引中的向量维度是否与当前 embed_model 一致。
 
     返回 True 表示一致，False 表示不一致（调用方应提示用户 rebuild）。
-    避免查询时 NumPy 报 inhomogeneous shape 错误。
 
-    适配 FaissVectorStore：通过 client.ntotal 获取向量数、client.d 获取维度。
-    同时兼容旧的 SimpleVectorStore（.data.embedding_dict）。
+    适配 QdrantVectorStore：通过 client.get_collection 获取向量数和维度。
+    collection 不存在（空库）时跳过检查。
     """
     vector_store = storage_context.vector_store
 
-    # 优先走 FaissVectorStore 路径
     try:
-        faiss_client = vector_store.client
-        if faiss_client.ntotal == 0:
+        client = vector_store.client
+        collection = vector_store.collection_name
+        if not client.collection_exists(collection):
+            return True  # 空库，无需检查
+        info = client.get_collection(collection)
+        if not info.points_count:
             return True  # 空索引，无需检查
-        stored_dim = faiss_client.d
+        vectors_cfg = info.config.params.vectors
+        # 非 hybrid 模式是单个 VectorParams；命名向量时是 dict（取第一个）
+        if isinstance(vectors_cfg, dict):
+            stored_dim = next(iter(vectors_cfg.values())).size
+        else:
+            stored_dim = vectors_cfg.size
     except AttributeError:
-        # 回退到 SimpleVectorStore 旧路径（兼容性）
-        try:
-            emb_dict = vector_store.data.embedding_dict
-        except AttributeError:
-            return True  # 无法访问，跳过检查
-        if not emb_dict:
-            return True  # 空索引，无需检查
-        stored_dim = len(next(iter(emb_dict.values())))
+        return True  # 无法访问，跳过检查
 
     expected_dim = _get_embed_dim()
     if stored_dim != expected_dim:
@@ -1309,60 +1296,299 @@ def _filter_near_duplicates(documents: list, store: _SimHashStore):
     return kept, skipped
 
 
-# ---- 存储后端工厂（FaissVectorStore + SimpleDocumentStore）----
-# 向量存储用 Faiss IndexHNSWFlat（二进制，加载快、查询快），
-# docstore/index_store 仍用 LlamaIndex 默认的 Simple 系列（JSON）。
-# LlamaIndex 0.14.x 无官方 SQLite docstore 后端，故 docstore 暂保留 JSON。
+# ---- 存储后端工厂（QdrantVectorStore + SQLiteKVStore）----
+# 向量库：Qdrant server 模式（默认）——本机 qdrant.exe 由程序自动拉起，
+#   向量/payload on_disk（mmap 按需读盘），大库启动秒级、常驻内存低，
+#   增量写入、metadata 过滤、支持删除、真正的 HNSW 索引。
+#   QDRANT_MODE=local 可回退旧的内嵌模式（纯文件，但大库启动需全量反序列化，慢）。
+# docstore/index_store：自研 SQLiteKVStore（sqlite_kvstore.py，官方无此包）——
+# 按需查询、增量提交，替代 SimpleKVStore 的 JSON 全量加载/全量重写。
+# 崩溃安全：Qdrant WAL + SQLite 事务各自保证，无需应用层 tmp+replace。
 
-FAISS_INDEX_FILENAME = "default__vector_store.faiss"
+QDRANT_MODE = os.environ.get("QDRANT_MODE", "server")  # server（默认）| local（回退）
+QDRANT_SERVER_HOST = os.environ.get("QDRANT_HOST", "127.0.0.1")  # 只绑定回环：不弹防火墙、局域网不可达
+QDRANT_SERVER_PORT = int(os.environ.get("QDRANT_PORT", "16333"))  # 不用 6333：Windows Hyper-V 动态端口排除段 6240-6339 会占掉它
+QDRANT_CONTAINER = os.environ.get("QDRANT_CONTAINER", "llamaindex-qdrant")  # Docker 容器名
+QDRANT_IMAGE = os.environ.get("QDRANT_IMAGE", "qdrant/qdrant:v1.19.0")
+QDRANT_VOLUME = os.environ.get("QDRANT_VOLUME", "llamaindex-qdrant-data")  # Docker named volume
+QDRANT_DIRNAME = "qdrant"            # local 模式的向量库目录（多文件）
+KVSTORE_DB_FILENAME = "docstore.db"  # docstore/index_store 共用的 SQLite 文件
+QDRANT_COLLECTION = "default"        # local 模式的 collection 名（每库目录独立，名固定即可）
 
 
-def _get_faiss_index_path(storage_dir: str) -> str:
-    """返回 faiss 索引文件路径。"""
-    return os.path.join(storage_dir, FAISS_INDEX_FILENAME)
+# ---- Qdrant 启动加载进度条 ----
+# qdrant-client local 模式在 QdrantClient(path=...) 时会把 collection 的全部
+# 向量点从 storage.sqlite 反序列化进内存（CollectionPersistence.load），
+# 百万级点的库要几分钟且默认无任何输出。monkey-patch load() 挂钩进度。
+
+_QDRANT_LOAD_PROGRESS_CB = None  # 可选回调 fn(done, total)，为 None 时走终端进度条
 
 
-def _make_storage_context(storage_dir: str, embed_dim: int) -> StorageContext:
+def set_qdrant_load_progress_callback(cb) -> None:
+    """设置/清除加载进度回调（app.py 的 Streamlit 进度条用）。传 None 恢复终端显示。"""
+    global _QDRANT_LOAD_PROGRESS_CB
+    _QDRANT_LOAD_PROGRESS_CB = cb
+
+
+def _default_load_progress(done: int, total: int) -> None:
+    """终端进度条：tty 下同行刷新（0.25s 节流）；非 tty 每 10% 打一行。"""
+    import time
+    state = _default_load_progress.__dict__
+    now = time.time()
+    if done < total and now - state.get("t", 0.0) < 0.25:
+        return
+    state["t"] = now
+    pct = done * 100 // total
+    if sys.stdout.isatty():
+        bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
+        end = "\n" if done == total else ""
+        sys.stdout.write(f"\r    -> 加载向量库: [{bar}] {pct:3d}% ({done:,}/{total:,}){end}")
+        sys.stdout.flush()
+    elif done == total or pct // 10 != state.get("pct10", -1):
+        state["pct10"] = pct // 10
+        print(f"    -> 加载向量库: {pct}% ({done:,}/{total:,})", flush=True)
+
+
+def _patch_qdrant_load_progress() -> None:
+    """monkey-patch CollectionPersistence.load，加载向量点时汇报进度。幂等。"""
+    from qdrant_client.local.persistence import CollectionPersistence
+
+    if getattr(CollectionPersistence.load, "_progress_patched", False):
+        return
+    orig_load = CollectionPersistence.load
+
+    def load_with_progress(self):
+        total = self.storage.cursor().execute("SELECT COUNT(*) FROM points").fetchone()[0]
+        if total <= 0:
+            yield from orig_load(self)
+            return
+        import time
+        cb = _QDRANT_LOAD_PROGRESS_CB or _default_load_progress
+        t0 = time.time()
+        for done, point in enumerate(orig_load(self), 1):
+            yield point
+            cb(done, total)
+        print(f"    -> 向量库加载完成: {total:,} 个点，耗时 {time.time() - t0:.1f}s", flush=True)
+
+    load_with_progress._progress_patched = True
+    CollectionPersistence.load = load_with_progress
+
+
+_patch_qdrant_load_progress()
+
+
+def _kb_storage_exists(storage_dir: str) -> bool:
+    """该知识库是否已有持久化数据（以 docstore.db 为准）。"""
+    return (Path(storage_dir) / KVSTORE_DB_FILENAME).exists()
+
+
+def _get_kvstore(index) -> SQLiteKVStore:
+    """从 index 的 docstore 中取出底层 SQLiteKVStore（docstore/index_store 共用一个）。"""
+    return index.storage_context.docstore._kvstore
+
+
+# ---- Qdrant server 模式：Docker 容器自动托管 ----
+# 为什么用 Docker 而不是 qdrant 官方 Windows 裸 exe：裸 exe 在 Windows 上删除
+# collection / 优化器合并段后的 rename 必然失败（已知 bug qdrant/qdrant#5924），
+# 写入负载下残留段会不断累积直至耗尽磁盘（本机实测 15GB 数据漏出 243GB）。
+# Linux 容器是 qdrant 官方推荐的 Windows 部署方式，无此问题。
+# 容器常驻（--restart unless-stopped），程序退出不回收——下次启动直接复用，保持热库。
+
+
+def _docker(args: list, timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(["docker"] + args, capture_output=True, text=True, timeout=timeout)
+
+
+def _docker_ok() -> bool:
+    try:
+        return _docker(["info"], timeout=15).returncode == 0
+    except Exception:
+        return False
+
+
+def _start_docker_desktop() -> None:
+    """拉起 Docker Desktop 并等待守护进程就绪。"""
+    exe = r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
+    if not os.path.isfile(exe):
+        raise RuntimeError(
+            "Docker Desktop 未安装。请安装 Docker Desktop，或设 QDRANT_MODE=local 回退内嵌模式。"
+        )
+    print("[Qdrant] Docker Desktop 未运行，正在拉起（首次约 30-60s）...")
+    os.startfile(exe)  # GUI 程序，startfile 最稳妥
+    import time
+    t0 = time.time()
+    while time.time() - t0 < 300:
+        if _docker_ok():
+            print(f"[Qdrant] Docker 守护进程就绪（{time.time() - t0:.0f}s）")
+            return
+        time.sleep(3)
+    raise RuntimeError("Docker Desktop 300s 内未就绪，请手动启动后重试")
+
+
+def _qdrant_http_ok(timeout: float = 2.0) -> bool:
+    """真实 HTTP 探活。注意不能只看端口：Docker Desktop 重启（如自动更新）后，
+    Windows 侧端口代理可能仍在 LISTEN 但转发已死——socket 能连上、请求全挂。"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+            f"http://{QDRANT_SERVER_HOST}:{QDRANT_SERVER_PORT}/collections", timeout=timeout
+        ) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _ensure_qdrant_server() -> None:
+    """确保 qdrant 服务端可用：HTTP 探活通过直接复用；否则经 Docker 启动/创建/自愈容器。
+
+    - 只绑定 127.0.0.1:16333（宿主）→ 容器内 6333，不弹防火墙、局域网不可达；
+    - 数据在 Docker named volume（QDRANT_VOLUME），Linux 文件系统语义，性能与
+      可靠性都优于挂载 Windows 目录；
+    - 容器常驻（--restart unless-stopped），本程序退出不回收；
+    - 自愈：容器在跑但 HTTP 不通（Docker Desktop 重启后端口代理 stale）→ 重启容器；
+    - 用户也可以自己用任何方式跑 qdrant（HTTP 通即直接复用）。
     """
-    创建使用 FaissVectorStore 的 StorageContext。
+    if _qdrant_http_ok():
+        return
+    if shutil.which("docker") is None:
+        raise RuntimeError(
+            "未检测到 docker 命令。请安装 Docker Desktop，或设 QDRANT_MODE=local 回退内嵌模式。"
+        )
+    if not _docker_ok():
+        _start_docker_desktop()
 
-    - 存在已持久化的 faiss 索引文件 → 加载之
-    - 不存在 → 新建空 IndexHNSWFlat（M=32, efConstruction=40, efSearch=16）
+    # 容器状态：running / exited / 不存在
+    r = _docker(["ps", "-a", "--format", "{{.Names}} {{.State}}"])
+    state = ""
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 1)
+        if parts and parts[0] == QDRANT_CONTAINER:
+            state = parts[1] if len(parts) > 1 else ""
+            break
 
-    注意：docstore/index_store 由 StorageContext.from_defaults 自动用 Simple 系列，
-    仍生成 docstore.json / index_store.json（由流式持久化补丁优化写盘）。
-    """
-    faiss_path = _get_faiss_index_path(storage_dir)
-
-    if os.path.exists(faiss_path):
-        # 加载已有 faiss 索引
-        vector_store = FaissVectorStore.from_persist_path(faiss_path)
+    if state == "running":
+        # 容器活着但 HTTP 不通 = 端口代理 stale，重启容器修复转发
+        print(f"[Qdrant] 容器 {QDRANT_CONTAINER} 在运行但 HTTP 不通，重启容器修复端口转发 ...")
+        restart = _docker(["restart", QDRANT_CONTAINER], timeout=120)
+        if restart.returncode != 0:
+            raise RuntimeError(f"重启 qdrant 容器失败: {restart.stderr.strip()}")
+    elif state:
+        print(f"[Qdrant] 启动已有容器 {QDRANT_CONTAINER}（状态: {state}）...")
+        start = _docker(["start", QDRANT_CONTAINER], timeout=120)
+        if start.returncode != 0:
+            raise RuntimeError(f"启动 qdrant 容器失败: {start.stderr.strip()}")
     else:
-        # 新建空 faiss 索引（IndexHNSWFlat：图索引，查询最快）
-        # M=32 是 HNSW 的连通性参数，越大精度越高、内存越大
-        # efConstruction=40 构建时搜索深度，efSearch=16 查询时搜索深度
-        faiss_index = faiss.IndexHNSWFlat(embed_dim, 32)
-        faiss_index.hnsw.efConstruction = 40
-        faiss_index.hnsw.efSearch = 16
-        vector_store = FaissVectorStore(faiss_index=faiss_index)
+        print(f"[Qdrant] 创建并启动容器 {QDRANT_CONTAINER}（{QDRANT_IMAGE}，首次需拉取镜像约 100MB）...")
+        run = _docker([
+            "run", "-d", "--name", QDRANT_CONTAINER,
+            "-p", f"{QDRANT_SERVER_HOST}:{QDRANT_SERVER_PORT}:6333",
+            "-v", f"{QDRANT_VOLUME}:/qdrant/storage",
+            "--restart", "unless-stopped",
+            QDRANT_IMAGE,
+        ], timeout=1800)  # 首次拉镜像可能较久
+        if run.returncode != 0:
+            raise RuntimeError(f"创建 qdrant 容器失败: {run.stderr.strip()}")
 
-    # docstore/index_store 仍用 Simple 系列（StorageContext.from_defaults 默认），
-    # 但显式传入 vector_store 以覆盖默认的 SimpleVectorStore
+    import time
+    t0 = time.time()
+    ready_timeout = float(os.environ.get("QDRANT_READY_TIMEOUT", "600"))
+    while time.time() - t0 < ready_timeout:
+        if _qdrant_http_ok():
+            print(f"[Qdrant] 服务端就绪（{time.time() - t0:.1f}s）")
+            return
+        time.sleep(1)
+    raise RuntimeError(
+        f"qdrant 容器 {ready_timeout:.0f}s 内未就绪，可用 docker logs {QDRANT_CONTAINER} 排查"
+    )
+
+
+def _make_qdrant_client() -> qdrant_client.QdrantClient:
+    """server 模式的 client（超时放宽到 60s，适应大批量 upsert）。"""
+    _ensure_qdrant_server()
+    return qdrant_client.QdrantClient(
+        url=f"http://{QDRANT_SERVER_HOST}:{QDRANT_SERVER_PORT}", timeout=60
+    )
+
+
+def _qdrant_collection_name(storage_dir: str) -> str:
+    """server 模式下 collection 名 = 知识库 id（storage_dir 末级目录名）。"""
+    return Path(storage_dir).name
+
+
+def _ensure_server_collection(client, name: str) -> None:
+    """server 上不存在该 collection 则按我们的参数预创建（on_disk 向量+payload）。
+
+    预创建后 llama-index 的 QdrantVectorStore 检测到已存在会直接复用。
+    on_disk=True：向量走 mmap 按需读盘——大库启动秒级、常驻内存低的关键。
+    维度取自当前 embedding 模型，与 _check_embed_consistency 口径一致。
+    """
+    if client.collection_exists(name):
+        return
+    client.create_collection(
+        collection_name=name,
+        vectors_config=qdrant_models.VectorParams(
+            size=_get_embed_dim(), distance=qdrant_models.Distance.COSINE, on_disk=True
+        ),
+        on_disk_payload=True,
+    )
+
+
+def _delete_kb_vector_data(storage_dir: str) -> None:
+    """删除知识库的向量数据。local 模式数据在 storage_dir 内，随 rmtree 一并删除，无需处理。
+
+    server 模式直接 API 删除 collection（Linux 容器内删除可靠；之前 Windows 裸 exe
+    的 rename bug #5924 在容器方案下不存在）。
+    """
+    if QDRANT_MODE == "local":
+        return
+    name = _qdrant_collection_name(storage_dir)
+    try:
+        client = _make_qdrant_client()
+        if client.collection_exists(name):
+            client.delete_collection(name)
+        client.close()
+    except Exception as e:
+        print(f"[警告] 删除 server 端 collection [{name}] 失败（{type(e).__name__}: {e}），"
+              f"可用 docker exec {QDRANT_CONTAINER} 或 qdrant Web UI 手动检查")
+
+
+def _make_storage_context(storage_dir: str) -> StorageContext:
+    """
+    创建 Qdrant + SQLite 后端的 StorageContext。
+
+    - Qdrant server 模式（默认）：连接/自动拉起 Docker 容器，collection 名 = 知识库 id；
+      向量与 payload on_disk（mmap 按需读盘），打开即用，大库无全量入内存步骤。
+    - QDRANT_MODE=local：旧的内嵌模式（数据在 storage_dir/qdrant/），仅作回退。
+    - docstore/index_store：共用同一个 SQLiteKVStore（storage_dir/docstore.db），
+      原文、哈希去重记忆、索引结构都在这一个库里，打开即用。
+    """
+    Path(storage_dir).mkdir(parents=True, exist_ok=True)
+    if QDRANT_MODE == "local":
+        client = qdrant_client.QdrantClient(path=os.path.join(storage_dir, QDRANT_DIRNAME))
+        collection_name = QDRANT_COLLECTION
+    else:
+        client = _make_qdrant_client()
+        collection_name = _qdrant_collection_name(storage_dir)
+        _ensure_server_collection(client, collection_name)
+    vector_store = QdrantVectorStore(client=client, collection_name=collection_name)
+    kvstore = SQLiteKVStore(os.path.join(storage_dir, KVSTORE_DB_FILENAME))
     return StorageContext.from_defaults(
+        docstore=KVDocumentStore(kvstore),
+        index_store=KVIndexStore(kvstore),
         vector_store=vector_store,
     )
 
 
 def _persist_storage(index, storage_dir: str) -> None:
     """
-    统一持久化：faiss 索引（.faiss 二进制）+ docstore/index_store（JSON）。
+    统一持久化（批次检查点调用）。
 
-    FaissVectorStore 自己管理 .faiss 文件的持久化，需单独调用 persist()。
-    storage_context.persist() 负责 docstore.json / index_store.json 的持久化。
+    - Qdrant（server/local 均持续走 WAL），无需显式落盘；
+    - docstore/index_store 的 SQLiteKVStore 为吞吐做了延迟 commit（见
+      sqlite_kvstore.py），在此显式提交，构成检查点语义：
+      崩溃最多丢失上一检查点之后的数据，重跑 ingest 靠哈希去重补齐。
     """
-    faiss_path = _get_faiss_index_path(storage_dir)
-    index.vector_store.persist(faiss_path)
-    index.storage_context.persist(persist_dir=storage_dir)
+    _get_kvstore(index).commit()
 
 
 # ---- IngestionPipeline 工厂函数 ----
@@ -1558,74 +1784,43 @@ def _select_knowledge_base() -> tuple:
 def _load_or_build_kb(kb_id: str, cfg: dict) -> VectorStoreIndex:
     """加载已有索引或创建空索引（等待用户 ingest）。
     每个类别库独立 storage 目录。无 data_dir 绑定，ingest 时由用户指定文件。
+
+    Qdrant server 模式（on_disk mmap）+ SQLite（按需查询）后端下，加载是秒级操作，
+    不再有 JSON 时代的全量解析等待，也不需要模拟进度条。
     """
     kb_storage = cfg["storage_dir"]
 
-    if Path(kb_storage).exists() and (Path(kb_storage) / "docstore.json").exists():
+    if _kb_storage_exists(kb_storage):
         print(f"[加载] 知识库 [{cfg.get('name', kb_id)}] 从 {kb_storage} 读取索引 ...")
-        storage_size = get_storage_size(kb_storage)
-        print(f"    存储容量: {format_size(storage_size)}")
+        print(f"    存储容量: {format_size(get_storage_size(kb_storage))}")
 
-        # LlamaIndex 的 StorageContext.from_defaults / load_index_from_storage 是原子操作，
-        # 无法在内部插桩。用基于存储大小的预估时间 + 后台线程模拟进度条，
-        # 最多推进到 95%，实际加载完成后跳到 100%。"相对准确"即可。
-        import time
-        import threading
-
-        # 预估速率 20 MB/s（JSON 反序列化 + 对象构建综合速率，偏保守）
-        estimated_time = max(storage_size / (20 * 1024 * 1024), 1.5)
-        is_tty = sys.stdout.isatty()
-        stop_event = threading.Event()
-
-        def _progress():
-            t0 = time.time()
-            while not stop_event.is_set():
-                elapsed = time.time() - t0
-                if elapsed <= estimated_time:
-                    pct = elapsed / estimated_time * 90
-                else:
-                    # 超过预估时间，缓慢推进到 95%（避免卡在 90%）
-                    pct = min(90 + (elapsed - estimated_time) * 2, 95)
-                bar_len = 30
-                filled = int(bar_len * pct / 100)
-                bar = "█" * filled + "░" * (bar_len - filled)
-                sys.stdout.write(f"\r    加载进度: [{bar}] {pct:.0f}% | {elapsed:.0f}s")
-                sys.stdout.flush()
-                time.sleep(0.2)
-
-        if is_tty:
-            pt = threading.Thread(target=_progress, daemon=True)
-            pt.start()
-        else:
-            print(f"    加载中（预计 {estimated_time:.0f}s）...")
-
-        t0_load = time.time()
         load_error = None
         try:
-            storage_context = _make_storage_context(kb_storage, _get_embed_dim())
+            storage_context = _make_storage_context(kb_storage)
             _check_embed_consistency(storage_context)
             index = load_index_from_storage(storage_context, index_id=INDEX_ID)
         except Exception as e:
             load_error = e
-        finally:
-            if is_tty:
-                stop_event.set()
-                pt.join()
 
         if load_error is None:
-            elapsed = time.time() - t0_load
-            if is_tty:
-                sys.stdout.write(f"\r    加载进度: [{'█' * 30}] 100% | {elapsed:.1f}s\n")
-                sys.stdout.flush()
-            else:
-                print(f"    [OK] 加载完成，耗时 {elapsed:.1f}s")
+            print(f"    [OK] 加载完成")
             return index
 
-        # 索引文件损坏（如上次写盘被中断，留下 0 字节/截断的 JSON）：
+        # 索引文件损坏（如上次写盘被中断）：
         # 与其崩溃，不如提示后重置为空库，用户重新 ingest 即可恢复。
         print(f"\n[警告] 知识库 [{cfg.get('name', kb_id)}] 索引文件损坏（{type(load_error).__name__}: {load_error}）")
         print(f"    已将 {kb_storage} 重置为空库，请重新 ingest 数据。")
+        # 关闭失败加载过程中可能已打开的连接（Windows 下占用文件句柄会导致 rmtree 失败）
+        try:
+            storage_context.docstore._kvstore.close()
+        except Exception:
+            pass
+        try:
+            storage_context.vector_store.client.close()
+        except Exception:
+            pass
         import shutil
+        _delete_kb_vector_data(kb_storage)  # server 模式：删除对应 collection
         shutil.rmtree(kb_storage, ignore_errors=True)
 
     # 无索引：创建空索引，等待用户手动 ingest
@@ -1633,58 +1828,11 @@ def _load_or_build_kb(kb_id: str, cfg: dict) -> VectorStoreIndex:
     print(f"    存储到: {kb_storage}")
     print(f"    使用 ingest <路径> 命令添加文档")
     Path(kb_storage).mkdir(parents=True, exist_ok=True)
-    storage_context = _make_storage_context(kb_storage, _get_embed_dim())
+    storage_context = _make_storage_context(kb_storage)
     index = VectorStoreIndex(nodes=[], storage_context=storage_context)
     index.set_index_id(INDEX_ID)
     _persist_storage(index, kb_storage)
     sys.stdout.flush()
-    return index
-
-
-def load_or_build_index() -> VectorStoreIndex:
-    """若 ./storage 已存在则直接加载；否则读数据源文档，经 IngestionPipeline 去重+向量化后构建并持久化。"""
-    if Path(STORAGE_DIR).exists() and (Path(STORAGE_DIR) / "docstore.json").exists():
-        print(f"[加载] 从 {STORAGE_DIR} 读取已持久化的索引 ...")
-        storage_context = _make_storage_context(STORAGE_DIR, _get_embed_dim())
-        _check_embed_consistency(storage_context)  # 维度不一致则直接退出
-        return load_index_from_storage(storage_context, index_id=INDEX_ID)
-
-    print(f"[构建] 读取数据源: {DATA_DIR}")
-    print("      只读取 .md 文件（自动跳过 .obsidian 配置目录等）")
-    reader = SimpleDirectoryReader(
-        input_dir=DATA_DIR,
-        required_exts=[".md"],       # 只读 markdown 笔记
-        recursive=True,              # 递归子目录
-        exclude=[".obsidian"],       # 排除 Obsidian 配置目录
-        filename_as_id=True,         # 用文件名作为 doc_id，便于调试和 list
-    )
-    documents = _read_documents_with_progress(reader, DATA_DIR)
-
-    # 限制文档数量（调试用）：MAX_DOCS=10 只处理前 10 个文档
-    max_docs = int(os.environ.get("MAX_DOCS", "0"))
-    if max_docs > 0 and len(documents) > max_docs:
-        print(f"    [调试] MAX_DOCS={max_docs}：只处理前 {max_docs} 个文档（共 {len(documents)} 个）")
-        documents = documents[:max_docs]
-
-    Path(STORAGE_DIR).mkdir(parents=True, exist_ok=True)
-    storage_context = _make_storage_context(STORAGE_DIR, _get_embed_dim())
-    pipeline = make_pipeline(storage_context)
-
-    print(f"[构建] 运行 IngestionPipeline（哈希去重 + 切块 + 向量化）...")
-    nodes = pipeline.run(documents=documents, show_progress=True)
-    hashes_after = len(storage_context.docstore.get_all_document_hashes())
-
-    # nodes 已由 pipeline 完成 embedding，VectorStoreIndex 会跳过已有 embedding 不重复计算
-    index = VectorStoreIndex(
-        nodes=nodes,
-        storage_context=storage_context,
-    )
-    index.set_index_id(INDEX_ID)
-    _persist_storage(index, STORAGE_DIR)
-    total_size = get_storage_size(STORAGE_DIR)
-    print(f"    -> 索引已持久化到 {STORAGE_DIR}，下次启动将直接加载")
-    print(f"    -> 输入 {len(documents)} 个文档，产出 {len(nodes)} 个节点，docstore 共跟踪 {hashes_after} 个唯一哈希")
-    print(f"    -> 存储容量: {format_size(total_size)}")
     return index
 
 
@@ -1803,7 +1951,7 @@ def _select_single_kb(configs: dict) -> tuple:
     for i, kid in enumerate(kb_ids, 1):
         cfg = configs[kid]
         marker = " (默认)" if i == default_idx else ""
-        storage_built = Path(cfg.get("storage_dir", ""), "docstore.json").exists()
+        storage_built = _kb_storage_exists(cfg.get("storage_dir", ""))
         if storage_built:
             size = format_size(get_storage_size(cfg.get("storage_dir", "")))
             built_tag = f" [已有数据 {size}]"
@@ -1961,15 +2109,17 @@ def main() -> None:
             all_configs = _load_kb_configs()
             for kid, cfg in all_configs.items():
                 current_mark = " [当前]" if kid == current_kb_id else ""
-                exists = Path(cfg["storage_dir"]).exists() and (Path(cfg["storage_dir"]) / "docstore.json").exists()
+                exists = _kb_storage_exists(cfg["storage_dir"])
                 if exists:
                     size = format_size(get_storage_size(cfg["storage_dir"]))
-                    # 只加载 docstore.json 统计节点数（不加载 faiss 索引，避免大库加载慢）
+                    # 直接查 SQLite 统计节点数（docstore/data 集合的行数），秒级完成
                     try:
-                        from llama_index.core.storage.docstore import SimpleDocumentStore
-                        docstore_path = os.path.join(cfg["storage_dir"], "docstore.json")
-                        ds = SimpleDocumentStore.from_persist_path(docstore_path)
-                        node_count = len(ds.docs)
+                        import sqlite3
+                        conn = sqlite3.connect(os.path.join(cfg["storage_dir"], KVSTORE_DB_FILENAME))
+                        node_count = conn.execute(
+                            "SELECT COUNT(*) FROM kvstore WHERE collection = 'docstore/data'"
+                        ).fetchone()[0]
+                        conn.close()
                     except Exception:
                         node_count = "?"
                 else:
@@ -1989,6 +2139,17 @@ def main() -> None:
             import shutil
             kb_storage = current_cfg["storage_dir"]
             size_before = get_storage_size(kb_storage)
+            # 先关闭当前索引持有的 SQLite/Qdrant 连接
+            #（两者持续占用文件句柄，Windows 下不关闭则 rmtree 会 PermissionError）
+            try:
+                _get_kvstore(index).close()
+            except Exception:
+                pass
+            try:
+                index.vector_store.client.close()
+            except Exception:
+                pass
+            _delete_kb_vector_data(kb_storage)  # server 模式：删除对应 collection
             if Path(kb_storage).exists():
                 shutil.rmtree(kb_storage)
                 print(f"已清空数据库（原 {format_size(size_before)}），重建空索引 ...")
@@ -2015,7 +2176,11 @@ def main() -> None:
                     fp = (node.metadata or {}).get("file_path", "未知")
                     source_files.add(fp)
                 try:
-                    vec_count = index.vector_store.client.ntotal
+                    vec_store = index.vector_store
+                    if vec_store.client.collection_exists(vec_store.collection_name):
+                        vec_count = vec_store.client.get_collection(vec_store.collection_name).points_count
+                    else:
+                        vec_count = 0
                 except Exception:
                     vec_count = "?"
                 print(f"  docstore 跟踪的唯一哈希数: {len(all_hashes)}")
@@ -2097,11 +2262,12 @@ def main() -> None:
                     total_files = sum(1 for p in Path(path).rglob("*") if p.is_file() and p.suffix.lower() in exts_l)
                 # 分批参数：从 retrieval_config.yaml 读取（可在配置文件中调整）
                 batch_size = _RETR_CFG["ingest"]["batch_size"]
+                doc_batch_size = _RETR_CFG["ingest"]["doc_batch_size"]
                 auto_continue_timeout = _RETR_CFG["ingest"]["auto_continue_timeout"]
                 # 单文件路径时强制单批（避免无意义的暂停提示）
                 if path.is_file():
                     batch_size = max(batch_size, total_files)
-                print(f"    -> 发现 {total_files} 个文件，分批处理（每批 {batch_size} 个），逐文件加载并增量写入（哈希+转载去重）...")
+                print(f"    -> 发现 {total_files} 个文件：每 {doc_batch_size} 个文件一批统一向量化，每 {batch_size} 个文件落盘一次检查点（哈希+转载去重，中断可续传）...")
                 pipeline = make_pipeline(index.storage_context)
                 size_before = get_storage_size(current_cfg["storage_dir"])
 
@@ -2142,6 +2308,47 @@ def main() -> None:
                 batch_num = 0
                 user_aborted = False
                 i = 0
+                # 向量化小批缓冲：积累 doc_batch_size 个文件统一跑一次 pipeline。
+                # 逐文件 pipeline.run 会让 bge-m3 每次都走小批量推理（GPU 利用率低、
+                # 固定开销按文件数叠加）；攒批后 embed_batch_size=64 才能吃满。
+                pending_docs = []    # 已通过转载拦截、等待向量化的文档
+                pending_infos = []   # 与 pending_docs 对齐的 (文件序号, 文件名)，供逐文件日志
+
+                def _flush_doc_batch():
+                    """把积累的小批文档统一向量化，并按来源文件归集节点数更新统计和日志。
+
+                    文档级哈希去重（DUPLICATES_ONLY）在 pipeline 内部照常生效：
+                    重复文档不产出节点。切块节点的 metadata 继承自文档（含 file_path），
+                    据此把节点归属回各文件，统计口径与逐文件处理完全一致。
+                    """
+                    nonlocal new_docs, skipped, total_nodes
+                    nonlocal batch_new_docs, batch_skipped, batch_nodes
+                    if not pending_docs:
+                        return
+                    new_nodes = pipeline.run(documents=pending_docs, show_progress=False)
+                    all_new_nodes.extend(new_nodes)
+                    total_nodes += len(new_nodes)
+                    batch_nodes += len(new_nodes)
+                    # 按来源文件归集节点数
+                    cnt = {}
+                    for n in new_nodes:
+                        fp = (n.metadata or {}).get("file_path", "")
+                        cnt[fp] = cnt.get(fp, 0) + 1
+                    for d, (di, dname) in zip(pending_docs, pending_infos):
+                        n_cnt = cnt.get((d.metadata or {}).get("file_path", ""), 0)
+                        if n_cnt:
+                            new_docs += 1
+                            batch_new_docs += 1
+                            if simhash_store is not None:
+                                simhash_store.add_text(d.get_content(), (d.metadata or {}).get("file_path", ""))
+                            tqdm.write(f"    [{di}/{total_files}] 处理: {dname}（产出 {n_cnt} 节点）")
+                        else:
+                            skipped += 1
+                            batch_skipped += 1
+                            tqdm.write(f"    [{di}/{total_files}] 处理: {dname}（产出 0 节点，哈希重复跳过）")
+                    pending_docs.clear()
+                    pending_infos.clear()
+
                 try:
                     for doc_batch in tqdm(reader.iter_data(), desc="ingest", unit="file", total=total_files, ncols=80, leave=False):
                         for doc in doc_batch:
@@ -2155,24 +2362,16 @@ def main() -> None:
                                 simhash_store.record_dup(dup_key, (doc.metadata or {}).get("file_path", ""))
                                 tqdm.write(f"    [{i}/{total_files}] 跳过转载: {fname}（与 {Path(dup_kept).name or dup_kept} 内容重复，汉明距离={dup_dist}）")
                             else:
-                                new_nodes = pipeline.run(documents=[doc], show_progress=False)
-                                all_new_nodes.extend(new_nodes)
-                                total_nodes += len(new_nodes)
-                                batch_nodes += len(new_nodes)
-                                if new_nodes:
-                                    new_docs += 1
-                                    batch_new_docs += 1
-                                    if simhash_store is not None:
-                                        simhash_store.add_text(doc.get_content(), (doc.metadata or {}).get("file_path", ""))
-                                else:
-                                    skipped += 1
-                                    batch_skipped += 1
-                                tqdm.write(f"    [{i}/{total_files}] 处理: {fname}（产出 {len(new_nodes)} 节点）")
+                                pending_docs.append(doc)
+                                pending_infos.append((i, fname))
+                                if len(pending_docs) >= doc_batch_size:
+                                    _flush_doc_batch()
                             # 批次边界：达到 batch_size 或最后一批
                             # 持久化 + 交互式暂停（10秒超时自动继续）
                             if i % batch_size == 0 or i >= total_files:
+                                _flush_doc_batch()  # 先把残余小批向量化，再落盘
                                 is_last_batch = i >= total_files
-                                # 写索引 + 流式持久化（中断后重跑 ingest 会因哈希去重自动跳过已落盘的文件）
+                                # 写索引 + 持久化（中断后重跑 ingest 会因哈希去重自动跳过已落盘的文件）
                                 if all_new_nodes:
                                     index.insert_nodes(all_new_nodes)
                                     all_new_nodes.clear()
@@ -2205,6 +2404,12 @@ def main() -> None:
                                 batch_near_skipped = 0
                         if user_aborted or i >= total_files:
                             break
+                except KeyboardInterrupt:
+                    # Ctrl+C：不再崩溃退出。已产出但未满一小批的文档（≤doc_batch_size 个）
+                    # 丢弃不处理（重跑时去重会补上），已产出的节点在下方"最终持久化"落盘，
+                    # 然后回到 REPL 提示符——相当于把 Ctrl+C 变成"立即中断并保存进度"。
+                    print(f"\n    [已中断] 收到 Ctrl+C，正在保存已处理的 {i}/{total_files} 个文件 ...")
+                    user_aborted = True
                 finally:
                     object.__setattr__(docstore, "get_all_document_hashes", _orig_get_hashes)
                     object.__setattr__(docstore, "set_document_hash", _orig_set_hash)
@@ -2244,7 +2449,11 @@ def main() -> None:
                         seen.add(fp)
                         file_list.append(fp)
                 try:
-                    vec_count = index.vector_store.client.ntotal
+                    vec_store = index.vector_store
+                    if vec_store.client.collection_exists(vec_store.collection_name):
+                        vec_count = vec_store.client.get_collection(vec_store.collection_name).points_count
+                    else:
+                        vec_count = 0
                 except Exception:
                     vec_count = "?"
                 parts = [

@@ -19,7 +19,8 @@ highlight:
   threshold: 0.5                # 相似度低于此值的句子不高亮
 
 ingest:
-  batch_size: 1000              # 单批 ingest 最大文件数（大库分批处理，避免一次性内存压力）
+  batch_size: 200               # 落盘检查点间隔（每 N 个文件持久化一次，中断后重跑自动跳过已落盘文件）
+  doc_batch_size: 32            # 向量化小批大小（每积累 N 个文件统一跑一次 pipeline，让 embedding 吃满批量）
   auto_continue_timeout: 10     # 每批结束后等待用户确认的秒数，超时自动继续下一批
 
 dedup:

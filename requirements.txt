@@ -5,10 +5,12 @@ llama-index-llms-deepseek==0.3.0
 llama-index-llms-ollama==0.10.1
 llama-index-llms-openai==0.6.26
 llama-index-readers-file==0.6.0
-llama-index-vector-stores-faiss>=0.6.0  # Faiss 向量存储后端（替换 SimpleVectorStore）
+llama-index-vector-stores-qdrant>=0.10.0  # Qdrant 向量存储后端
 
 # ===== 向量检索引擎 =====
-faiss-cpu>=1.14.0
+qdrant-client>=1.18.0  # server 模式：连接 Docker 容器中的 qdrant（程序自动拉起容器）
+                       # 向量/payload on_disk mmap，大库启动秒级；设 QDRANT_MODE=local 回退内嵌模式
+# docstore/index_store 后端：项目自研 SQLiteKVStore（sqlite_kvstore.py，官方无此包），仅需标准库 sqlite3
 
 # ===== Embedding 模型栈 =====
 sentence-transformers==5.6.0

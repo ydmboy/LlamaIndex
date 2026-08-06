@@ -33,6 +33,11 @@ from run_vector_demo import (
     _select_single_kb,  # 不直接用（CLI 交互），但参考其逻辑
     # 索引/存储
     make_pipeline,
+    _make_storage_context,
+    _persist_storage,
+    _kb_storage_exists,
+    set_qdrant_load_progress_callback,
+    _delete_kb_vector_data,
     get_storage_size,
     format_size,
     # 转载去重（SimHash）
@@ -59,11 +64,8 @@ from llama_index.core import (
     Settings,
     SimpleDirectoryReader,
     VectorStoreIndex,
-    StorageContext,
     load_index_from_storage,
 )
-from llama_index.core.ingestion import IngestionPipeline
-from llama_index.core.node_parser import SentenceSplitter
 from llama_index.llms.deepseek import DeepSeek
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
@@ -138,65 +140,40 @@ def init_global_settings():
 
 
 def load_index_with_progress(storage_dir: str, kb_name: str = ""):
-    """加载已有索引或创建空索引，显示预估进度条。
+    """加载已有索引或创建空索引。
 
-    有索引 → 加载（显示进度条）
-    无索引 → 创建空索引（快速，显示提示）
+    qdrant-client local 模式启动时会把全部向量点反序列化进内存
+    （百万级点的库需数分钟），进度经 set_qdrant_load_progress_callback
+    挂钩到 Streamlit 进度条。
     """
-    import threading
-
-    index_exists = os.path.exists(os.path.join(storage_dir, "docstore.json"))
-
-    if not index_exists:
+    if not _kb_storage_exists(storage_dir):
         # 空库：创建空索引
         st.info(f"📭 创建空数据库: {kb_name}")
-        from llama_index.core import VectorStoreIndex
-        storage_context = StorageContext.from_defaults()
-        index = VectorStoreIndex(storage_context=storage_context)
+        storage_context = _make_storage_context(storage_dir)
+        index = VectorStoreIndex(nodes=[], storage_context=storage_context)
         index.set_index_id(INDEX_ID)
-        os.makedirs(storage_dir, exist_ok=True)
-        index.storage_context.persist(storage_dir)
+        _persist_storage(index, storage_dir)
         st.success(f"✅ 空数据库已创建 | 存储到: {storage_dir}")
         st.info("💡 请切换到「📥 Ingest」Tab 添加文档")
         return index
 
-    storage_size = get_storage_size(storage_dir)
-    # 预估速率 20 MB/s（JSON 反序列化 + 对象构建综合速率，偏保守）
-    estimated_time = max(storage_size / (20 * 1024 * 1024), 2.0)
+    bar = st.progress(0.0, text=f"加载索引中（{format_size(get_storage_size(storage_dir))}）...")
+    state = {"n": 0}
 
-    st.info(f"存储容量: {format_size(storage_size)} | 预估加载 {estimated_time:.0f}s")
+    def _cb(done: int, total: int) -> None:
+        # 节流：每 5000 个点刷一次，避免 Streamlit 重绘开销拖慢加载
+        if done == total or done - state["n"] >= 5000:
+            state["n"] = done
+            bar.progress(done / total, text=f"加载向量库: {done:,}/{total:,} ({done * 100 // total}%)")
 
-    progress_bar = st.progress(0, text=f"加载中（预估 {estimated_time:.0f}s）...")
-    status_text = st.empty()
-
-    stop_event = threading.Event()
-
-    def _push_progress():
-        t0 = time.time()
-        while not stop_event.is_set():
-            elapsed = time.time() - t0
-            if elapsed <= estimated_time:
-                pct = elapsed / estimated_time * 90
-            else:
-                # 超过预估时间，缓慢推进到 95%
-                pct = min(90 + (elapsed - estimated_time) * 2, 95)
-            pct_int = int(pct)
-            progress_bar.progress(pct_int, text=f"加载进度 {pct_int}% | {elapsed:.1f}s")
-            time.sleep(0.2)
-
-    pt = threading.Thread(target=_push_progress, daemon=True)
-    pt.start()
-
-    t0_load = time.time()
+    set_qdrant_load_progress_callback(_cb)
     try:
-        storage_context = StorageContext.from_defaults(persist_dir=storage_dir)
+        storage_context = _make_storage_context(storage_dir)
         index = load_index_from_storage(storage_context, index_id=INDEX_ID)
     finally:
-        stop_event.set()
-        pt.join()
-
-    elapsed = time.time() - t0_load
-    progress_bar.progress(100, text=f"✅ 加载完成 | 耗时 {elapsed:.1f}s")
+        set_qdrant_load_progress_callback(None)
+        bar.empty()
+    st.success("✅ 索引加载完成")
     return index
 
 
@@ -223,7 +200,7 @@ def render_sidebar():
     selected_kb_id = kb_options[selected_label]
     cfg = configs[selected_kb_id]
     storage_dir = cfg.get("storage_dir", f"./storage/{selected_kb_id}")
-    index_exists = os.path.exists(os.path.join(storage_dir, "docstore.json"))
+    index_exists = _kb_storage_exists(storage_dir)
 
     # 显示该数据库状态
     if index_exists:
@@ -344,7 +321,7 @@ def render_chat_tab():
         selected_kb_id = kb_options[selected_label]
         cfg = configs[selected_kb_id]
         storage_dir = cfg.get("storage_dir", f"./storage/{selected_kb_id}")
-        index_exists = os.path.exists(os.path.join(storage_dir, "docstore.json"))
+        index_exists = _kb_storage_exists(storage_dir)
 
         # 显示选中数据库状态
         if index_exists:
@@ -569,20 +546,12 @@ def _do_ingest(data_dir: str):
         logs.append(f"  -> 读取到 {len(documents)} 个文档")
         progress_bar.progress(25, text=f"读取到 {len(documents)} 个文档")
 
-        # 2) 构建 pipeline
+        # 2) 构建 pipeline：复用当前已加载索引的 storage_context（Qdrant+SQLite
+        # 连接），与 CLI 同一工厂，避免重复建连接、避免 docstore 不一致
         logs.append("[2/4] 构建去重管道 ...")
         status_text.text("[2/4] 构建 IngestionPipeline ...")
-        storage_context = StorageContext.from_defaults(
-            persist_dir=st.session_state.current_kb_cfg["storage_dir"]
-        )
-        pipeline = IngestionPipeline(
-            transformations=[
-                SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP),
-                Settings.embed_model,
-            ],
-            docstore_strategy="duplicates_only",
-            docstore=storage_context.docstore,
-        )
+        storage_context = st.session_state.index.storage_context
+        pipeline = make_pipeline(storage_context)
         progress_bar.progress(50, text="向量化中 ...")
 
         # 2.5) SimHash 转载过滤（与 CLI 共用同一套指纹库，近似转载直接跳过）
@@ -606,7 +575,7 @@ def _do_ingest(data_dir: str):
         logs.append("[4/4] 插入索引 + 持久化 ...")
         status_text.text("[4/4] 插入索引 + 保存 ...")
         st.session_state.index.insert_nodes(nodes)
-        storage_context.persist(persist_dir=st.session_state.current_kb_cfg["storage_dir"])
+        _persist_storage(st.session_state.index, st.session_state.current_kb_cfg["storage_dir"])
         if simhash_store is not None:
             simhash_store.save()
 
@@ -662,7 +631,7 @@ def render_kb_management_tab():
 
     # 统计
     total = len(configs)
-    has_index = sum(1 for kb_id, cfg in configs.items() if os.path.exists(os.path.join(cfg.get("storage_dir", ""), "docstore.json")))
+    has_index = sum(1 for kb_id, cfg in configs.items() if _kb_storage_exists(cfg.get("storage_dir", "")))
     col1, col2, col3 = st.columns(3)
     col1.metric("知识库总数", total)
     col2.metric("已构建索引", has_index)
@@ -674,7 +643,7 @@ def render_kb_management_tab():
     st.subheader("📋 知识库列表")
     for kb_id, cfg in configs.items():
         storage_dir = cfg.get("storage_dir", f"./storage/{kb_id}")
-        index_exists = os.path.exists(os.path.join(storage_dir, "docstore.json"))
+        index_exists = _kb_storage_exists(storage_dir)
         size = get_storage_size(storage_dir) if index_exists else 0
 
         with st.expander(f"{'✅' if index_exists else '⬜'} {cfg.get('name', kb_id)} [{kb_id}]"):
@@ -720,6 +689,19 @@ def render_kb_management_tab():
 
             if col_btn2.button("🗑️ 删除索引", key=f"del_{kb_id}"):
                 if os.path.exists(storage_dir):
+                    # 删除当前已加载的库前，先关闭其 SQLite/Qdrant 连接
+                    #（Windows 下文件被占用会导致 rmtree 失败）
+                    if kb_id == st.session_state.get("current_kb_id") and st.session_state.get("index"):
+                        try:
+                            st.session_state.index.storage_context.docstore._kvstore.close()
+                        except Exception:
+                            pass
+                        try:
+                            st.session_state.index.vector_store.client.close()
+                        except Exception:
+                            pass
+                        st.session_state.index = None
+                    _delete_kb_vector_data(storage_dir)  # server 模式：删除对应 collection
                     shutil.rmtree(storage_dir, ignore_errors=True)
                     st.success(f"已删除索引: {storage_dir}")
                     st.rerun()
